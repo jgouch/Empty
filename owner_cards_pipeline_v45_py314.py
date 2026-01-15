@@ -175,9 +175,19 @@ def normalize_state(st: str) -> str:
     st_clean = st.upper().replace(".", "").strip()
     return STATE_MAP.get(st_clean, st_clean)
 
+def find_state_match(line: str, zipm: Optional[re.Match]) -> Optional[re.Match]:
+    matches = list(re.finditer(US_STATE_RE, line or "", flags=re.IGNORECASE))
+    if not matches:
+        return None
+    if zipm:
+        for m in reversed(matches):
+            if m.end() <= zipm.start():
+                return m
+    return matches[-1]
+
 def extract_zip_state(line: str) -> Tuple[Optional[str], Optional[str]]:
     zipm = re.search(ZIP_RE, line or "")
-    statem = re.search(US_STATE_RE, line or "", flags=re.IGNORECASE)
+    statem = find_state_match(line or "", zipm)
     found_zip = zipm.group(0) if zipm else None
     found_state = normalize_state(statem.group(0)) if statem else None
     return found_zip, found_state
@@ -582,17 +592,16 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
     """Parse a single-line address containing street + city + state + ZIP."""
     if not line:
         return None
-    z, st = extract_zip_state(line)
-    if not (z and st):
+    zipm = re.search(ZIP_RE, line)
+    statem = find_state_match(line, zipm)
+    if not zipm or not statem:
         return None
     if not re.search(STREET_START_RE, line):
         return None
 
-    state_match = re.search(US_STATE_RE, line, re.IGNORECASE)
-    if not state_match:
-        return None
-
-    before_state = normalize_ws(line[:state_match.start()].rstrip(",")).strip()
+    z = zipm.group(0)
+    st = normalize_state(statem.group(0))
+    before_state = normalize_ws(line[:statem.start()].rstrip(",")).strip()
     if not before_state:
         return None
 
