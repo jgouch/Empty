@@ -86,7 +86,7 @@ NAME_BLACKLIST = [
 
 NAME_NOISE_PATTERNS = [
     r"\btoor\b", r"\bmbo\b", r"\byoh\b", r"\bsbo\b",
-    r"^\d+[\s\-A-Z]*\b", r"^[;:\.,\-\*]+", 
+    r"^\d+[\sA-Z-]*\b", r"^[;:\.,\-\*]+", 
     r"\bowner\s*id\b.*", r"\bowner\s*since\b.*",
     r"\d+" 
 ]
