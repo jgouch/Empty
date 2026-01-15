@@ -1,43 +1,41 @@
+
 #!/usr/bin/env python3
 """
-Owner Card Pipeline (Local) — Excel-Safe + Excel-Length-Safe (Final Hardened v28.1)
+Owner Card Pipeline (Local) — Text-Layer-First + Middle Initial Preservation (v41)
 
-- OCR scanned PDF owner cards
-- Extract owner/name/address + item lines
-- Best-effort strike-through detection
-- Classify: Property vs Memorial vs Funeral Preneed vs At-Need Funeral
-- Compute Prime / Mailing lists
-- Export Excel workbook with multiple sheets
+Key v41 upgrades:
+- TEXT-LAYER-FIRST: Uses Adobe OCR text layer via PyPDF2. Falls back to Tesseract OCR only if needed.
+- PRESERVE MIDDLE INITIALS: Fixes common OCR digit-as-initial errors (e.g., "B." -> "8.")
+- RESCUE LEADING LETTER MISREADS: Fixes "8ABBITT" -> "BABBITT" (when target letter matches).
+- TEMPLATE-AWARE ITEM PARSING: Modern "Item Description" cards parsed from text layer; legacy cards parsed heuristically.
+- OCR fallback improved: deskew, polarity normalization, improved ghost scan, pass scoring, correct winner propagation.
 
 Usage:
-  python3 owner_cards_pipeline.py --pdf "A (all).pdf" --out "OwnerCards_A_Output.xlsx"
-
-V28.1 Fixes (Post-Review):
-- FIX: RawTextHash now hashes the COMBINED text (Std + CLAHE) for accurate duplicate detection.
-- FIX: 'PossibleDuplicateScans' stat now reports actual count, not 0.
-- IMPROVEMENT: Record IDs are now dynamic based on Target Letter (e.g., B-P0001) instead of hardcoded 'A-'.
+  python3 owner_cards_pipeline.py
+  (Automatically finds and processes any "X (all).pdf" in the folder)
 """
 
 import argparse
 import hashlib
-import json
+import glob
 import os
 import re
-import sys
 import unicodedata
 from datetime import datetime
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional
 
 import pandas as pd
 from tqdm import tqdm
 
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 import pytesseract
 from pytesseract import Output
 
 import cv2
 import numpy as np
 from PIL import Image
+from PyPDF2 import PdfReader
+
 
 # -----------------------------
 # CONFIG
@@ -56,14 +54,15 @@ STATE_MAP = {
     "TEXAS": "TX", "UTAH": "UT", "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA",
     "WEST VIRGINIA": "WV", "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC",
     "TENN": "TN", "TENNESSES": "TN", "TEN": "TN", "TENN.": "TN", "TN.": "TN",
-    "TIN": "TN", "IN": "TN" 
+    # Your original “IN -> TN” was risky; keep only if you really need it:
+    "TIN": "TN",
 }
 
 CITY_BLOCKLIST = [
-    "NASHVILLE", "BRENTWOOD", "FRANKLIN", "MADISON", "ANTIOCH", 
-    "HERMITAGE", "OLD HICKORY", "GOODLETTSVILLE", "PEGRAM", 
+    "NASHVILLE", "BRENTWOOD", "FRANKLIN", "MADISON", "ANTIOCH",
+    "HERMITAGE", "OLD HICKORY", "GOODLETTSVILLE", "PEGRAM",
     "CLARKSVILLE", "MURFREESBORO", "LEBANON", "GALLATIN", "FAIRVIEW",
-    "WHITE BLUFF", "CENTERVILLE"
+    "WHITE BLUFF", "CENTERVILLE", "CHAPEL HILL"
 ]
 
 US_STATE_RE = r"\b(" + "|".join(STATE_MAP.keys()) + r"|" + "|".join(STATE_MAP.values()) + r")\b"
@@ -71,18 +70,21 @@ ZIP_RE = r"\b\d{5}(?:-\d{4})?\b"
 STREET_START_RE = r"^\d+\s+[A-Za-z0-9]"
 
 NAME_BLACKLIST = [
-    r"\btransfer", r"\bsold\s+to", r"\bgiven\s+to", r"\bspaces", 
-    r"\bcontract", r"\bsee\s+new", r"\bvoid", 
+    r"\btransfer", r"\bsold\s+to", r"\bgiven\s+to", r"\bspaces",
+    r"\bcontract", r"\bsee\s+new", r"\bvoid",
     r"\bcancel", r"\bdeed", r"\binterment", r"\bitem\s+description",
     r"\bprice\b", r"\bsales\s+date", r"\bused\b",
-    r"\bdivorced\b", r"\bdeceased\b", r"\bwidow\b"
+    r"\bdivorced\b", r"\bdeceased\b", r"\bwidow\b",
+    r"\bgarden\b", r"\bsection\b", r"\blot\b", r"\bblock\b",
+    r"\bsermon\b", r"\bchapel\b", r"\bmt\b", r"\bmountain\b",
+    r"\bsex\b", r"\bmale\b", r"\bfemale\b", r"\bgrave\b"
 ]
 
 NAME_NOISE_PATTERNS = [
     r"\btoor\b", r"\bmbo\b", r"\byoh\b", r"\bsbo\b",
-    r"^\d+[\s\-A-Z]*\b", r"^[;:\.,\-\*]+", 
+    r"^\d+[\s\-A-Z]*\b", r"^[;:\.,\-\*]+",
     r"\bowner\s*id\b.*", r"\bowner\s*since\b.*",
-    r"\d+" 
+    r"\d+"
 ]
 
 ADDRESS_BLOCKERS = [
@@ -116,12 +118,10 @@ INTERMENT_SERVICE_PATTERNS = [
 ]
 
 TRANSFER_CANCEL_PATTERNS = [
-    r"\bcancel(?:led|ed)?\b", r"\bvoid\b", r"\bno\s+longer\b",
+    r"\bcancel(?:led|ed)?\b", r"\bvoid\b", r"\bno\s+longer\b", r"\brefunded\b", r"\btransfe?r\b",
 ]
 
 RIGHTS_NOTATION_RE = re.compile(r"\b(\d+)\s*/\s*(\d+)\b")
-
-CACHE_DIR = "_ocr_cache_v28"
 
 EXCEL_CELL_MAX = 32767
 EXCEL_SAFE_MAX = 32000
@@ -146,8 +146,15 @@ PROPERTY_PATTERNS = [
     r"\bcremation\b", r"\b\d+[:]\w+[:]\d+\b", r"\b\d+[/]\w+[/]\d+\b", r"\b\w+[/]\d+[/]\w+\b"
 ] + GARDEN_PATTERNS_RAW
 
+
+# OCR configs
+OCR_PSM6 = "--oem 3 -l eng --psm 6"
+OCR_PSM11 = "--oem 3 -l eng --psm 11"
+OCR_PSM3 = "--oem 3 -l eng --psm 3"
+
+
 # -----------------------------
-# Helpers
+# REGEX HELPERS
 # -----------------------------
 
 def compile_any(patterns: List[str]) -> List[re.Pattern]:
@@ -165,7 +172,6 @@ def safe_upper(s: str) -> str:
 def matches_any(line: str, patterns: List[re.Pattern]) -> bool:
     return any(p.search(line or "") for p in patterns)
 
-# Compile regexes
 RE_FUNERAL_PN = compile_any(FUNERAL_PN_PATTERNS)
 RE_AT_NEED = compile_any(AT_NEED_FUNERAL_PATTERNS)
 RE_MEMORIAL = compile_any(MEMORIAL_PATTERNS)
@@ -177,10 +183,76 @@ RE_NAME_BLACKLIST = compile_any(NAME_BLACKLIST)
 RE_NAME_NOISE = compile_any(NAME_NOISE_PATTERNS)
 RE_ADDR_BLOCK = compile_any(ADDRESS_BLOCKERS)
 
+
+# -----------------------------
+# INITIAL PRESERVATION (v41)
+# -----------------------------
+
+INITIAL_DIGIT_MAP = {
+    "8": "B",
+    "0": "O",
+    "1": "I",
+    "2": "Z",
+    "5": "S",
+    "6": "G",
+    "9": "P",
+}
+
+def fix_digit_initials_in_name(line: str) -> str:
+    """
+    Convert single-token digit initials to letters:
+      'Cynthia 8.' -> 'Cynthia B.'
+    Only changes a token that looks like an initial (single digit with optional punctuation)
+    and only when it follows a name-like token.
+    """
+    if not line:
+        return line
+
+    tokens = line.split()
+    out = []
+    for i, tok in enumerate(tokens):
+        core = tok
+        trail = ""
+        while core and core[-1] in ".,;:":
+            trail = core[-1] + trail
+            core = core[:-1]
+
+        if len(core) == 1 and core.isdigit() and core in INITIAL_DIGIT_MAP:
+            if i > 0 and re.search(r"[A-Za-z]", tokens[i - 1]):
+                fixed = INITIAL_DIGIT_MAP[core] + (trail if trail else ".")
+                out.append(fixed)
+                continue
+
+        out.append(tok)
+    return " ".join(out)
+
+def fix_leading_digit_as_letter(line: str, target_char: Optional[str] = None) -> str:
+    """
+    Fix cases like '8ABBITT, ...' -> 'BABBITT, ...' when:
+    - leading char is a digit that maps to a letter
+    - it otherwise looks like a surname line (comma early, uppercase-ish)
+    - and optional target_char matches mapped letter
+    """
+    if not line:
+        return line
+    first = line[0]
+    if first.isdigit() and first in INITIAL_DIGIT_MAP:
+        if len(line) > 2 and line[1].isalpha() and ("," in line[:20] or line[:20].isupper()):
+            repl = INITIAL_DIGIT_MAP[first]
+            if (not target_char) or (repl.upper() == target_char.upper()):
+                return repl + line[1:]
+    return line
+
+
+# -----------------------------
+# ADDRESS / TEXT HELPERS
+# -----------------------------
+
 def normalize_state(st: str) -> str:
-    if not st: return ""
+    if not st:
+        return ""
     st_clean = st.upper().replace(".", "").strip()
-    return STATE_MAP.get(st_clean, st_clean) 
+    return STATE_MAP.get(st_clean, st_clean)
 
 def extract_zip_state(line: str) -> Tuple[Optional[str], Optional[str]]:
     zipm = re.search(ZIP_RE, line or "")
@@ -193,47 +265,101 @@ def extract_zip_state(line: str) -> Tuple[Optional[str], Optional[str]]:
     return (found_zip, found_state)
 
 def looks_like_address_line(line: str) -> bool:
-    if not line: return False
+    if not line:
+        return False
     z, st = extract_zip_state(line)
-    if z and st: return True
+    if z and st:
+        return True
     return bool(re.search(
         r"\b(st|street|rd|road|ave|avenue|blvd|dr|drive|ln|lane|ct|court|cir|circle|hwy|highway|pkwy|parkway|trl|trail|pl|place)\b",
         line, re.IGNORECASE
     ))
 
 def split_lines(raw_text: str) -> List[str]:
-    raw_text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    raw_text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = [normalize_ws(x) for x in raw_text.split("\n")]
     return [x for x in lines if x]
 
 def extract_phone(text: str) -> str:
     phones = []
-    # Enhanced Regex for dots and spaces
-    m_full = re.findall(r"(?:\(?(\d{3})\)?[\s\-\./]?)?(\d{3})[\s\-\./]?(\d{4})", text)
+    m_full = re.findall(r"(?:\(?(\d{3})\)?[\s\-\./]?)?(\d{3})[\s\-\./]?(\d{4})", text or "")
     for area, pre, suf in m_full:
-        if not area: area = "615"
+        if not area:
+            area = "615"
         if len(area) == 3 and len(pre) == 3 and len(suf) == 4:
             phones.append(f"({area}) {pre}-{suf}")
-    if phones: return phones[0] 
-    return ""
+    return phones[0] if phones else ""
+
+def excel_safe_text(v):
+    if v is None:
+        return ""
+    try:
+        if pd.isna(v):
+            return ""
+    except Exception:
+        pass
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        try:
+            if np.isinf(v):
+                return ""
+        except Exception:
+            pass
+        return v
+    s = str(v)
+    try:
+        s = unicodedata.normalize("NFKD", s)
+    except Exception:
+        pass
+    s = re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]", "", s)
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
+    s_l = s.lstrip()
+    if s_l.startswith(("=", "+", "-", "@")):
+        s = "'" + s
+    if len(s) > EXCEL_SAFE_MAX:
+        s = s[: (EXCEL_SAFE_MAX - len(TRUNC_SUFFIX))] + TRUNC_SUFFIX
+    return s
+
+def make_df_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    for c in df2.columns:
+        df2[c] = df2[c].map(excel_safe_text)
+    return df2
+
+def choose_excel_engine() -> str:
+    try:
+        import xlsxwriter  # noqa: F401
+        return "xlsxwriter"
+    except Exception:
+        return "openpyxl"
+
 
 # -----------------------------
-# IMAGE STRATEGIES
+# OCR / IMAGE HELPERS (fallback)
 # -----------------------------
+
+def deskew_bgr(img_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    coords = np.column_stack(np.where(thr > 0))
+    if coords.size == 0:
+        return img_bgr
+    rect = cv2.minAreaRect(coords)
+    angle = rect[-1]
+    angle = -(90 + angle) if angle < -45 else -angle
+    h, w = img_bgr.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    return cv2.warpAffine(img_bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+def ensure_dark_text_on_white(bin_img: np.ndarray) -> np.ndarray:
+    return 255 - bin_img if np.mean(bin_img) < 127 else bin_img
 
 def preprocess_standard(pil_img: Image.Image) -> Image.Image:
     img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    binary = ensure_dark_text_on_white(binary)
     return Image.fromarray(binary)
-
-def preprocess_thickening(pil_img: Image.Image) -> Image.Image:
-    img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
-    kernel = np.ones((2, 2), np.uint8)
-    dilated = cv2.erode(binary, kernel, iterations=1)
-    return Image.fromarray(dilated)
 
 def preprocess_clahe(pil_img: Image.Image) -> Image.Image:
     img_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
@@ -243,25 +369,182 @@ def preprocess_clahe(pil_img: Image.Image) -> Image.Image:
     cl = clahe.apply(l)
     limg = cv2.merge((cl, a, b))
     enhanced = cv2.cvtColor(cv2.cvtColor(limg, cv2.COLOR_LAB2BGR), cv2.COLOR_BGR2GRAY)
-    binary = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 8)
-    return Image.fromarray(binary)
+    bin_img = cv2.adaptiveThreshold(enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    bin_img = ensure_dark_text_on_white(bin_img)
+    return Image.fromarray(bin_img)
+
+def preprocess_ghost(pil_img: Image.Image) -> Image.Image:
+    # improved faint-text strategy
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    bin_img = ensure_dark_text_on_white(bin_img)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    bin_img = cv2.dilate(bin_img, kernel, iterations=1)
+    return Image.fromarray(bin_img)
+
+def group_text_lines_from_ocr(data: Dict) -> List[Dict]:
+    n = len(data.get("text", []))
+    words = []
+    for i in range(n):
+        txt = data["text"][i]
+        if not txt or not str(txt).strip():
+            continue
+        try:
+            conf = int(float(data["conf"][i]))
+        except Exception:
+            conf = -1
+        if 0 <= conf < 30:
+            continue
+        words.append({
+            "text": str(txt).strip(),
+            "x": int(data["left"][i]),
+            "y": int(data["top"][i]),
+            "w": int(data["width"][i]),
+            "h": int(data["height"][i]),
+            "line_num": int(data["line_num"][i]),
+            "block_num": int(data["block_num"][i]),
+            "par_num": int(data["par_num"][i]),
+            "conf": conf,
+        })
+
+    groups = {}
+    for w in words:
+        key = (w["block_num"], w["par_num"], w["line_num"])
+        groups.setdefault(key, []).append(w)
+
+    lines = []
+    for key, ws in groups.items():
+        ws = sorted(ws, key=lambda z: z["x"])
+        text = normalize_ws(" ".join([w["text"] for w in ws]))
+        x1 = min(w["x"] for w in ws); y1 = min(w["y"] for w in ws)
+        x2 = max(w["x"] + w["w"] for w in ws); y2 = max(w["y"] + w["h"] for w in ws)
+        lines.append({"key": key, "text": text, "bbox": (x1, y1, x2, y2)})
+
+    lines.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
+    return lines
+
+def detect_horizontal_strikelines(img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1))
+    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+    edges = cv2.Canny(horiz, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=80, maxLineGap=10)
+    segs = []
+    if lines is None:
+        return segs
+    for l in lines[:, 0, :]:
+        x1, y1, x2, y2 = map(int, l)
+        if abs(y2 - y1) <= 3 and abs(x2 - x1) >= 80:
+            segs.append((x1, y1, x2, y2))
+    return segs
+
+def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple[int, int, int, int]]) -> bool:
+    x1, y1, x2, y2 = line_bbox
+    midy = (y1 + y2) // 2
+    for sx1, sy1, sx2, sy2 in strike_segs:
+        if y1 - 2 <= sy1 <= y2 + 2 and not (sx2 < x1 or sx1 > x2):
+            return True
+        if abs(sy1 - midy) <= 3 and not (sx2 < x1 or sx1 > x2):
+            return True
+    return False
+
 
 # -----------------------------
-# OCR + Parsing helpers
+# PDF TEXT LAYER (Adobe OCR)
+# -----------------------------
+
+def extract_pdf_text_page(pdf_path: str, page_index: int) -> str:
+    try:
+        reader = PdfReader(pdf_path)
+        if page_index >= len(reader.pages):
+            return ""
+        txt = reader.pages[page_index].extract_text() or ""
+        return txt
+    except Exception:
+        return ""
+
+def text_layer_usable(txt: str) -> bool:
+    if not txt:
+        return False
+    t = normalize_ws(txt)
+    if sum(ch.isalpha() for ch in t) < 40:
+        return False
+    # positive signals
+    anchors = ["ITEM DESCRIPTION", "OWNER ID", "CONTRACT", "LOT", "SECTION", "GARDEN", "NASHVILLE", "TENNESSEE", "TN"]
+    if any(a in t.upper() for a in anchors):
+        return True
+    return len(t) > 250
+
+def detect_template_type(text: str) -> str:
+    t = (text or "").upper()
+    if "INTERMENT RECORD" in t:
+        return "interment_record"
+    if "ITEM DESCRIPTION" in t or "OWNER ID" in t or "CONTRACT NBR" in t:
+        return "modern_table"
+    return "legacy_typewritten"
+
+
+# -----------------------------
+# NAME CLEANING / HEADER PARSING
 # -----------------------------
 
 def is_gibberish(text: str) -> bool:
-    if not text: return True
-    if len(text) < 3: return True
-    if not any(c.isupper() for c in text): return True
-    if not re.search(r'[AEIOUYaeiouy]', text): return True
+    if not text:
+        return True
+    if len(text) < 3:
+        return True
+    if not any(c.isupper() for c in text):
+        return True
+    if not re.search(r"[AEIOUYaeiouy]", text):
+        return True
     words = text.split()
     single_char_words = sum(1 for w in words if len(w) == 1 and w.lower() not in ['a', 'i'])
-    if len(words) > 0 and (single_char_words / len(words) > 0.5): return True
+    if len(words) > 0 and (single_char_words / len(words) > 0.4):
+        return True
     return False
 
-def clean_name_line(line: str, target_char: Optional[str] = None) -> str:
-    if not line: return ""
+def repair_word_start(word: str, target_char: str) -> str:
+    if not word or not target_char:
+        return word
+    t = target_char.upper()
+    w = word
+    confusables = {
+        'B': ['P', 'D', 'R', 'E', '8', '6', '3', '>', 'e', 'h', '|3'],
+        'A': ['4', '@', '^', 'R'],
+        'D': ['0', 'O', 'Q'],
+        'G': ['C', '6'],
+        'S': ['5', '$'],
+        'Z': ['2']
+    }
+    if t in confusables:
+        first_char = w[0].upper()
+        if first_char in confusables[t]:
+            if w.startswith('>e') or w.startswith('>E'):
+                return t + w[2:]
+            return t + w[1:]
+    return w
+
+def clean_name_line(line: str, target_char: Optional[str] = None, aggressive: bool = False) -> str:
+    if not line:
+        return ""
+
+    # v41: preserve middle initials like "8." -> "B."
+    line = fix_digit_initials_in_name(line)
+
+    # v41: rescue leading digit-as-letter (e.g., 8ABBITT)
+    if re.match(r"^\d", line):
+        line = fix_leading_digit_as_letter(line, target_char)
+        if re.match(r"^\d", line):
+            return ""
+
+    if matches_any(line, [re.compile(p, re.IGNORECASE) for p in [r"\bSermon\b", r"\bChapel\b", r"\bGarden\b", r"\bSection\b", r"\bMount\b", r"\bMt\.?\b"]]):
+        return ""
+    if matches_any(line, [re.compile(p, re.IGNORECASE) for p in [r"\bSex\b", r"\bMale\b", r"\bFemale\b", r"\bGrave\b"]]):
+        return ""
 
     line_upper = line.upper()
     for city in CITY_BLOCKLIST:
@@ -270,56 +553,68 @@ def clean_name_line(line: str, target_char: Optional[str] = None) -> str:
             line = line[:idx]
             line_upper = line.upper()
 
-    if "#" in line: line = line.split("#")[0]
-    if re.match(r"^\d", line): return "" 
+    if "#" in line:
+        line = line.split("#")[0]
 
+    # Cut off if street keywords appear (avoid swallowing address)
     m_kw = re.search(r"\b(road|rd|street|st|avenue|ave|drive|dr|lane|ln|court|ct|blvd|boulevard|pkwy|parkway|hwy|highway|trl|trail|cir|circle|pl|place|po\s*box|box)\b", line, re.IGNORECASE)
-    if m_kw: line = line[:m_kw.start()]
+    if m_kw:
+        line = line[:m_kw.start()]
 
     m_addr_start = re.search(r"\b\d+\s+[A-Za-z]", line)
-    if m_addr_start: line = line[:m_addr_start.start()]
+    if m_addr_start:
+        line = line[:m_addr_start.start()]
 
     cleaned = line
     for pat in RE_NAME_NOISE:
         cleaned = pat.sub("", cleaned)
-    
-    if target_char:
+
+    if target_char and aggressive:
         tc = target_char.upper()
         words = cleaned.split()
         cleaned_words = []
         found_start = False
-        
+
         for i, w in enumerate(words):
-            w_clean = re.sub(r"^[^a-zA-Z]+", "", w)
+            w_repaired = repair_word_start(w, tc)
+            w_clean = re.sub(r"^[^a-zA-Z]+", "", w_repaired)
+
             if w_clean.upper().startswith(tc):
-                cleaned_words.append(w_clean)
+                cleaned_words.append(w_repaired)
                 cleaned_words.extend(words[i+1:])
                 found_start = True
                 break
-            # Fuzzy match BDAIR -> ADAIR
-            if len(w_clean) > 3:
-                first_char = w_clean[0].upper()
-                if first_char in ['B', 'O', '4', '@', 'F'] and tc == 'A':
-                    w_corrected = 'A' + w_clean[1:]
-                    cleaned_words.append(w_corrected)
+
+            if tc in w.upper():
+                match_idx = w.upper().find(tc)
+                valid_part = w[match_idx:]
+                if len(valid_part) > 2:
+                    cleaned_words.append(valid_part)
                     cleaned_words.extend(words[i+1:])
                     found_start = True
                     break
-        
+
         if found_start:
             cleaned = " ".join(cleaned_words)
         else:
-            if is_gibberish(cleaned): return ""
+            if is_gibberish(cleaned):
+                return ""
+    else:
+        pass
 
-    cleaned = re.sub(r"[^a-zA-Z\s&.,\-]", "", cleaned)
+    # Keep letters + basic punctuation including periods (for initials)
+    cleaned = re.sub(r"[^a-zA-Z\s&\.,\-']", "", cleaned)
     return normalize_ws(cleaned)
 
 def clean_address_line(line: str) -> str:
-    if not line: return ""
+    if not line:
+        return ""
     m_owner = re.search(r"\bowner\s*(since|id)", line, re.IGNORECASE)
-    if m_owner: line = line[:m_owner.start()]
+    if m_owner:
+        line = line[:m_owner.start()]
     m_date = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}", line)
-    if m_date: line = line[:m_date.start()]
+    if m_date:
+        line = line[:m_date.start()]
     return normalize_ws(line)
 
 def parse_best_address(lines: List[str]) -> Dict:
@@ -331,17 +626,22 @@ def parse_best_address(lines: List[str]) -> Dict:
             prev_idx = i - 1
             if prev_idx >= 0:
                 street_candidate = lines[prev_idx]
-            
+
             street_candidate = clean_address_line(street_candidate)
-            street_candidate = re.sub(r"^[\W_]+", "", street_candidate) 
+            street_candidate = re.sub(r"^[\W_]+", "", street_candidate)
 
             score = 50
             if street_candidate and re.search(STREET_START_RE, street_candidate):
                 score += 40
-            
-            if "," in street_candidate: score -= 40 # Strong penalty for names
-            if len(street_candidate) < 5: score -= 20
-                
+
+            if re.search(r"^[A-Z][a-z]+,\s+[A-Z]", street_candidate):
+                score -= 100
+            elif "," in street_candidate:
+                score -= 30
+
+            if len(street_candidate) < 5:
+                score -= 20
+
             candidates.append({
                 "Index": prev_idx if prev_idx >= 0 else i,
                 "Street": street_candidate,
@@ -350,78 +650,93 @@ def parse_best_address(lines: List[str]) -> Dict:
                 "ZIP": z,
                 "Score": score
             })
+
     if not candidates:
         for i, line in enumerate(lines):
             if looks_like_address_line(line):
-                 return {"Index": i, "Street": "", "CityStateZip": line, "State": "", "ZIP": "", "Score": 10, "AddressRaw": line}
+                return {"Index": i, "Street": "", "CityStateZip": line, "State": "", "ZIP": "", "Score": 10, "AddressRaw": line}
         return {"Index": None, "Street": "", "CityStateZip": "", "State": "", "ZIP": "", "Score": 0, "AddressRaw": ""}
+
     best = sorted(candidates, key=lambda x: x["Score"], reverse=True)[0]
-    
     street = best["Street"]
-    if best["Score"] <= 0: street = ""
+    if best["Score"] <= 0:
+        street = ""
 
     city = ""
     if best["State"]:
         orig_state_match = re.search(US_STATE_RE, best["CityStateZip"], re.IGNORECASE)
         if orig_state_match:
-             state_span = orig_state_match.span()
-             city_part = best["CityStateZip"][:state_span[0]]
-             city = normalize_ws(city_part).replace(",", "")
-    
+            state_span = orig_state_match.span()
+            city_part = best["CityStateZip"][:state_span[0]]
+            city = normalize_ws(city_part).replace(",", "")
+
     return {
-        "Index": best["Index"], "Street": street, "City": city,
-        "State": best["State"], "ZIP": best["ZIP"], "AddressRaw": f"{street} | {best['CityStateZip']}"
+        "Index": best["Index"],
+        "Street": street,
+        "City": city,
+        "State": best["State"],
+        "ZIP": best["ZIP"],
+        "AddressRaw": f"{street} | {best['CityStateZip']}"
     }
 
-def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> Tuple[str, str, str, str, Dict]:
-    if not lines: return ("", "", "", "", {})
-    
-    top = lines[:40] 
+def get_header_candidate(lines: List[str], addr_idx: Optional[int], target_char: Optional[str], aggressive: bool = False) -> List[str]:
+    clean_header = []
+    top = lines[:40]
+    search_lines = top[:addr_idx] if (addr_idx is not None and addr_idx > 0) else top[:8]
+    if addr_idx:
+        search_iter = range(len(search_lines) - 1, -1, -1)
+    else:
+        search_iter = range(len(search_lines))
+
+    for i in search_iter:
+        ln = search_lines[i]
+        if not ln.strip():
+            continue
+        if matches_any(ln, RE_NAME_BLACKLIST):
+            continue
+
+        ln_cleaned = clean_name_line(ln, target_char, aggressive)
+        if not ln_cleaned:
+            continue
+        if is_gibberish(ln_cleaned):
+            continue
+
+        if addr_idx:
+            clean_header.insert(0, ln_cleaned)
+        else:
+            clean_header.append(ln_cleaned)
+
+        if len(clean_header) >= 2:
+            break
+
+    return clean_header
+
+def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> Tuple[str, str, str, str, Dict, bool]:
+    if not lines:
+        return ("", "", "", "", {}, False)
+
+    top = lines[:40]
     addr_info = parse_best_address(top)
     addr_idx = addr_info.get("Index", None)
 
-    clean_header = []
-    search_lines = top[:addr_idx] if (addr_idx is not None and addr_idx > 0) else top[:5]
-    if addr_idx: search_iter = range(len(search_lines) - 1, -1, -1)
-    else: search_iter = range(len(search_lines))
+    is_interment = any("INTERMENT RECORD" in ln.upper() for ln in top[:15])
+    if is_interment:
+        return ("INTERMENT RECORD - REFILE", "INTERMENT RECORD - REFILE", "", "", {}, True)
 
-    # Standard Search
-    for i in search_iter:
-        ln = search_lines[i]
-        if not ln.strip(): continue
-        if matches_any(ln, RE_NAME_BLACKLIST): continue
-        ln_cleaned = clean_name_line(ln, target_char)
-        if not ln_cleaned: continue 
-        if is_gibberish(ln_cleaned): continue
-        if addr_idx: clean_header.insert(0, ln_cleaned)
-        else: clean_header.append(ln_cleaned)
-        if len(clean_header) >= 2: break
+    # PASS 1 conservative
+    clean_header = get_header_candidate(lines, addr_idx, target_char, aggressive=False)
 
-    # V28: THE NAME HUNTER (Deep Search)
-    if not clean_header:
-        # Strategy 1: Look for "Word, Word" structure (Last, First)
-        # Prioritize lines starting with Target Char
-        for ln in top[:20]: 
-            if matches_any(ln, RE_NAME_BLACKLIST): continue
-            if target_char:
-                tc = target_char.upper()
-                # Pattern: Starts with Target Char, Word, Comma, Word
-                # Allow for some leading noise via search, not match
-                if re.search(r"\b" + tc + r"[a-z]+,\s+[A-Z][a-z]+", ln, re.IGNORECASE):
-                    fallback = clean_name_line(ln, target_char)
-                    if fallback and not is_gibberish(fallback):
-                        clean_header.append(fallback)
-                        break
-        
-        # Strategy 2: If still nothing, look for "Sold to" anchor
-        if not clean_header:
-            for i, ln in enumerate(top):
-                if re.search(r"\b(owner|sold\s+to|transfer)\b", ln, re.IGNORECASE):
-                    if i + 1 < len(top):
-                        fallback = clean_name_line(top[i+1], target_char)
-                        if fallback and not is_gibberish(fallback):
-                            clean_header.append(fallback)
-                            break
+    is_valid = False
+    if clean_header:
+        candidate_text = normalize_ws(" ".join(clean_header))
+        if target_char and candidate_text.upper().startswith(target_char.upper()):
+            is_valid = True
+        elif not target_char and not is_gibberish(candidate_text):
+            is_valid = True
+
+    # PASS 2 aggressive
+    if not is_valid:
+        clean_header = get_header_candidate(lines, addr_idx, target_char, aggressive=True)
 
     header_text = normalize_ws(" ".join(clean_header))
     header_text = re.sub(r"\b(owner|address|phone|lot|section|space|card)\b[:\-]?", "", header_text, flags=re.IGNORECASE).strip()
@@ -439,110 +754,44 @@ def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> T
     else:
         primary = header_text
 
-    # Final Check: If Primary still missing/junk, flag it
-    if not primary or is_gibberish(primary):
-        primary = "[MISSING - CHECK PDF]"
-    elif target_char and not primary.upper().startswith(target_char.upper()):
-        # Relaxed check: if it contains the target char at start of ANY word
-        # (clean_name_line should have handled this, but just in case)
-        pass 
+    if "," in primary:
+        last_name = primary.split(",")[0].strip()
+    elif " " in primary:
+        last_name = primary.split(" ")[0].strip()
+    else:
+        last_name = primary
 
-    if "," in primary: last_name = primary.split(",")[0].strip()
-    elif " " in primary: last_name = primary.split(" ")[0].strip()
-    else: last_name = primary
+    return (header_text, primary, secondary, last_name, addr_info, False)
 
-    return (header_text, primary, secondary, last_name, addr_info)
 
 # -----------------------------
-# PROPERTY PARSING
+# PROPERTY + CLASSIFICATION
 # -----------------------------
+
 def extract_property_details(line: str) -> Dict[str, str]:
     details = {"Garden": "", "Section": "", "Lot": "", "Space": ""}
-    if not line: return details
+    if not line:
+        return details
+
     for p_re in RE_GARDEN_CHECK:
         m = p_re.search(line)
         if m:
             details["Garden"] = normalize_ws(m.group(0))
             break
+
     m_sec = re.search(r"\b(sec|section|blk|block)\.?\s*([A-Za-z0-9\-]+)", line, re.IGNORECASE)
-    if m_sec: details["Section"] = m_sec.group(2)
+    if m_sec:
+        details["Section"] = m_sec.group(2)
+
     m_lot = re.search(r"\b(lot)\.?\s*([A-Za-z0-9\-]+)", line, re.IGNORECASE)
-    if m_lot: details["Lot"] = m_lot.group(2)
+    if m_lot:
+        details["Lot"] = m_lot.group(2)
+
     m_sp = re.search(r"\b(sp|space|grave)\.?\s*([A-Za-z0-9\-\./]+)", line, re.IGNORECASE)
-    if m_sp: details["Space"] = m_sp.group(2)
-    if ":" in line:
-        parts = [p.strip() for p in line.split(":") if p.strip()]
-        for part in parts:
-            if not details["Garden"] and any(p_re.search(part) for p_re in RE_GARDEN_CHECK):
-                details["Garden"] = part
-            elif not details["Space"] and re.match(r"^(sp|space)", part, re.IGNORECASE):
-                details["Space"] = re.sub(r"^(sp|space)\.?", "", part, flags=re.IGNORECASE).strip()
-            elif not details["Space"] and re.match(r"^\d+(-\d+)*$", part):
-                if not details["Lot"]: details["Lot"] = part
-                else: details["Space"] = part
-            elif not details["Section"] and len(part) <= 2 and part.isalpha():
-                details["Section"] = part
+    if m_sp:
+        details["Space"] = m_sp.group(2)
+
     return details
-
-def group_text_lines_from_ocr(data: Dict) -> List[Dict]:
-    n = len(data.get("text", []))
-    words = []
-    for i in range(n):
-        txt = data["text"][i]
-        if not txt or not str(txt).strip(): continue
-        try: conf = int(float(data["conf"][i]))
-        except Exception: conf = -1
-        if 0 <= conf < 30: continue
-        words.append({
-            "text": str(txt).strip(), "x": int(data["left"][i]), "y": int(data["top"][i]),
-            "w": int(data["width"][i]), "h": int(data["height"][i]), "line_num": int(data["line_num"][i]),
-            "block_num": int(data["block_num"][i]), "par_num": int(data["par_num"][i]), "conf": conf,
-        })
-    groups = {}
-    for w in words:
-        key = (w["block_num"], w["par_num"], w["line_num"])
-        groups.setdefault(key, []).append(w)
-    lines = []
-    for key, ws in groups.items():
-        ws = sorted(ws, key=lambda z: z["x"])
-        text = normalize_ws(" ".join([w["text"] for w in ws]))
-        x1 = min(w["x"] for w in ws); y1 = min(w["y"] for w in ws)
-        x2 = max(w["x"] + w["w"] for w in ws); y2 = max(w["y"] + w["h"] for w in ws)
-        lines.append({"key": key, "text": text, "bbox": (x1, y1, x2, y2)})
-    lines.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
-    return lines
-
-def detect_horizontal_strikelines(img_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
-    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY_INV, 25, 15)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 1))
-    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-    edges = cv2.Canny(horiz, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=80, minLineLength=80, maxLineGap=10)
-    segs = []
-    if lines is None: return segs
-    for l in lines[:, 0, :]:
-        x1, y1, x2, y2 = map(int, l)
-        if abs(y2 - y1) <= 3 and abs(x2 - x1) >= 80:
-            segs.append((x1, y1, x2, y2))
-    return segs
-
-def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple[int, int, int, int]]) -> bool:
-    x1, y1, x2, y2 = line_bbox
-    midy = (y1 + y2) // 2
-    for sx1, sy1, sx2, sy2 in strike_segs:
-        if y1 - 2 <= sy1 <= y2 + 2 and not (sx2 < x1 or sx1 > x2): return True
-        if abs(sy1 - midy) <= 3 and not (sx2 < x1 or sx1 > x2): return True
-    return False
-
-def standardize_name(name: str) -> str:
-    name = normalize_ws(name)
-    name = re.sub(r"[^\w\s\-\.'&]", "", name)
-    return name
-
-def owner_key(primary: str, secondary: str, addr: Dict) -> str:
-    parts = [safe_upper(primary), safe_upper(secondary), safe_upper(addr.get("Street", "")), (addr.get("ZIP", "") or "")]
-    return sha1_text("|".join(parts))[:12]
 
 def is_excludable_item(line: str) -> bool:
     return matches_any(line, RE_XFER)
@@ -557,13 +806,16 @@ def classify_item(line: str) -> Dict[str, bool]:
         "IsIntermentService": matches_any(t, RE_INTERMENT),
         "HasRightsNotation": bool(RIGHTS_NOTATION_RE.search(t)),
     }
-    if flags["IsIntermentService"]: flags["IsFuneralPreneed"] = False
-    if flags["IsAtNeedFuneral"]: flags["IsFuneralPreneed"] = False
+    if flags["IsIntermentService"]:
+        flags["IsFuneralPreneed"] = False
+    if flags["IsAtNeedFuneral"]:
+        flags["IsFuneralPreneed"] = False
     return flags
 
 def rights_used_total(line: str) -> Optional[Tuple[int, int, str]]:
     m = RIGHTS_NOTATION_RE.search(line or "")
-    if not m: return None
+    if not m:
+        return None
     a, b = int(m.group(1)), int(m.group(2))
     return (a, b, f"{a}/{b}")
 
@@ -573,9 +825,11 @@ def total_owners_on_file(primary: str, secondary: str) -> int:
 def compute_likely_burials(items: List[Dict]) -> int:
     used_counts: List[int] = []
     for it in items:
-        if not it.get("Include", False): continue
-        if not it.get("IsProperty", False): continue
-        
+        if not it.get("Include", False):
+            continue
+        if not it.get("IsProperty", False):
+            continue
+
         txt = (it.get("LineText", "") or "").upper()
         if re.search(r"\bX\b", txt) or re.search(r"\bUSED\b", txt):
             used_counts.append(1)
@@ -583,239 +837,359 @@ def compute_likely_burials(items: List[Dict]) -> int:
         ru = it.get("RightsUsed", None)
         if ru is not None:
             try:
-                if not pd.isna(ru): used_counts.append(int(ru))
-            except Exception: pass
-            
+                if not pd.isna(ru):
+                    used_counts.append(int(ru))
+            except Exception:
+                pass
+
     return max(used_counts) if used_counts else 0
 
+
 # -----------------------------
-# MAIN PIPELINE (V27 HYBRID)
+# ITEMS PARSING (Text Layer)
 # -----------------------------
 
-def process_page_hybrid(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str]) -> Tuple[Dict, List[Dict]]:
-    # V27: Run TWO scans. 
-    # 1. Standard (for Address)
-    # 2. CLAHE (for Faint Names/Property)
-    
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    
-    # --- SCAN A: STANDARD ---
+def item_dict_from_line(txt: str, struck: bool = False) -> Dict:
+    excludable = is_excludable_item(txt)
+    cls = classify_item(txt)
+
+    prop_details = {"Garden": "", "Section": "", "Lot": "", "Space": ""}
+    if cls["IsProperty"]:
+        prop_details = extract_property_details(txt)
+
+    looks_item = (
+        cls["IsProperty"] or cls["IsMemorial"] or cls["IsFuneralPreneed"] or cls["IsAtNeedFuneral"] or cls["HasRightsNotation"]
+    )
+
+    include = looks_item and (not struck) and (not excludable)
+
+    rt = rights_used_total(txt)
+
+    return {
+        "LineText": txt,
+        "StruckThrough": bool(struck),
+        "ExcludedByText": bool(excludable),
+        "Include": bool(include),
+        "IsProperty": bool(cls["IsProperty"]),
+        "IsMemorial": bool(cls["IsMemorial"]),
+        "IsFuneralPreneed": bool(cls["IsFuneralPreneed"]),
+        "IsAtNeedFuneral": bool(cls["IsAtNeedFuneral"]),
+        "IsIntermentService": bool(cls["IsIntermentService"]),
+        "RightsNotation": rt[2] if rt else "",
+        "RightsUsed": rt[0] if rt else None,
+        "RightsTotal": rt[1] if rt else None,
+        "Prop_Garden": prop_details["Garden"],
+        "Prop_Section": prop_details["Section"],
+        "Prop_Lot": prop_details["Lot"],
+        "Prop_Space": prop_details["Space"]
+    }
+
+def parse_items_modern_table(lines: List[str]) -> List[Dict]:
+    """
+    For modern cards with 'Item Description' header.
+    Uses text layer; can't see true strikethrough, but 'Used' or 'X' signals are captured in line text.
+    """
+    items = []
+    in_items = False
+
+    for ln in lines:
+        u = ln.upper()
+
+        if "ITEM DESCRIPTION" in u:
+            in_items = True
+            continue
+        if not in_items:
+            continue
+
+        # Stop around footer blocks
+        if "OWNER ID" in u or "OWNER SINCE" in u:
+            break
+
+        txt = normalize_ws(ln)
+        if not txt:
+            continue
+
+        # Skip column header-only lines
+        if txt.upper() in {"USED", "USED?", "CONTRACT NBR", "SALES DATE", "PRICE"}:
+            continue
+
+        # Heuristic "struck": if explicit X-only column fragments appear, keep as text; don't strike
+        items.append(item_dict_from_line(txt, struck=False))
+
+    return items
+
+def parse_items_legacy(lines: List[str]) -> List[Dict]:
+    """
+    For legacy cards, we treat any line after the header block that looks like a property/memorial/service line as an item.
+    """
+    items = []
+    # Skip top header-ish region
+    body = lines[5:]  # simple; your classification logic already filters aggressively
+    for ln in body:
+        txt = normalize_ws(ln)
+        if not txt:
+            continue
+        # avoid obvious header-ish noise
+        if matches_any(txt, RE_NAME_BLACKLIST):
+            continue
+        cls = classify_item(txt)
+        if cls["IsProperty"] or cls["IsMemorial"] or cls["IsFuneralPreneed"] or cls["IsAtNeedFuneral"] or cls["HasRightsNotation"]:
+            items.append(item_dict_from_line(txt, struck=False))
+    return items
+
+def parse_items_from_text(lines: List[str], template_type: str) -> List[Dict]:
+    if template_type == "modern_table":
+        return parse_items_modern_table(lines)
+    if template_type == "interment_record":
+        return []  # you route these elsewhere
+    return parse_items_legacy(lines)
+
+
+# -----------------------------
+# OCR PASS SCORING (fallback)
+# -----------------------------
+
+def score_text_pass(txt: str) -> int:
+    if not txt:
+        return 0
+    u = txt.upper()
+    score = 0
+    if re.search(ZIP_RE, u):
+        score += 40
+    if re.search(US_STATE_RE, u, re.IGNORECASE):
+        score += 20
+    if "OWNER ID" in u:
+        score += 20
+    if "ITEM DESCRIPTION" in u:
+        score += 20
+    if re.search(r"\b(GARDEN|SECTION|LOT|SPACE|CRYPT|MAUS|MAUSOLEUM)\b", u):
+        score += 10
+    lines = split_lines(txt)
+    good_lines = [ln for ln in lines if not is_gibberish(ln)]
+    score += min(len(good_lines), 60)
+    return score
+
+
+# -----------------------------
+# PAGE PROCESSOR (v41 hybrid)
+# -----------------------------
+
+def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str]) -> Tuple[Dict, List[Dict], bool]:
+    # 1) TEXT LAYER FIRST
+    pdf_text = extract_pdf_text_page(pdf_path, page_index)
+    if text_layer_usable(pdf_text):
+        # normalize and preserve initials inside header parsing
+        txt = pdf_text
+        lines = split_lines(txt)
+        template_type = detect_template_type(txt)
+
+        header_raw, p, s, last, addr, is_interment = parse_owner_header(lines, target_char)
+        phone = extract_phone(txt)
+
+        if is_interment:
+            items = []
+        else:
+            items = parse_items_from_text(lines, template_type)
+
+        combined_raw = txt
+        return ({
+            "OwnerName_Raw": normalize_ws(f"{p} {s}"),
+            "PrimaryOwnerName": p,
+            "SecondaryOwnerName": s,
+            "LastName": last,
+            "Phone": phone,
+            "Street": addr.get("Street", ""),
+            "City": addr.get("City", ""),
+            "State": addr.get("State", ""),
+            "ZIP": addr.get("ZIP", ""),
+            "AddressRaw": addr.get("AddressRaw", ""),
+            "RawText": combined_raw,
+            "RawTextHash": sha1_text(combined_raw),
+            "TemplateType": template_type,
+            "TextSource": "PDF_TEXT_LAYER",
+        }, items, is_interment)
+
+    # 2) FALLBACK TO OCR (image)
     imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
-    if not imgs: raise RuntimeError(f"Failed to render page {page_index+1}")
+    if not imgs:
+        raise RuntimeError(f"Failed to render page {page_index+1}")
+
     pil_original = imgs[0].convert("RGB")
-    
+
+    # deskew
+    orig_bgr = cv2.cvtColor(np.array(pil_original), cv2.COLOR_RGB2BGR)
+    orig_bgr = deskew_bgr(orig_bgr)
+    pil_original = Image.fromarray(cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB))
+
+    # preprocessed variants
     pil_std = preprocess_standard(pil_original)
     pil_clahe = preprocess_clahe(pil_original)
-    
-    # Perform OCR A (Std)
-    d_std = pytesseract.image_to_data(pil_std, config='--psm 6', output_type=Output.DICT)
-    t_std = pytesseract.image_to_string(pil_std, config='--psm 6')
-    
-    # Perform OCR B (Clahe)
-    d_clahe = pytesseract.image_to_data(pil_clahe, config='--psm 6', output_type=Output.DICT)
-    t_clahe = pytesseract.image_to_string(pil_clahe, config='--psm 6')
-    
-    # Parse A
-    lines_a = split_lines(t_std)
-    _, p_a, s_a, l_a, addr_a = parse_owner_header(lines_a, target_char)
-    phone_a = extract_phone(t_std)
-    
-    # Parse B
-    lines_b = split_lines(t_clahe)
-    _, p_b, s_b, l_b, addr_b = parse_owner_header(lines_b, target_char)
-    phone_b = extract_phone(t_clahe)
-    
-    # --- MERGE STRATEGY ---
-    
-    # Name Priority: Look for valid 'A' name in B (Clahe), then A (Std).
-    final_primary = "[MISSING - CHECK PDF]"
-    final_secondary = ""
-    final_last = ""
-    
-    # Check B first (better for faint names)
-    if p_b and p_b != "[MISSING - CHECK PDF]":
-        final_primary, final_secondary, final_last = p_b, s_b, l_b
-    elif p_a and p_a != "[MISSING - CHECK PDF]":
-        final_primary, final_secondary, final_last = p_a, s_a, l_a
-        
-    # Address Priority: Look for valid Address in A (Std - usually cleaner), then B.
-    final_addr = addr_a
-    if not final_addr.get("ZIP"):
-        if addr_b.get("ZIP"): final_addr = addr_b
-        
-    # Phone Priority:
-    final_phone = phone_a if phone_a else phone_b
-    
-    # Item Merge: Combine items from BOTH, removing duplicates by text hash
+    pil_ghost = preprocess_ghost(pil_original)
+
+    # OCR strings
+    t_std = pytesseract.image_to_string(pil_std, config=OCR_PSM6)
+    t_clahe = pytesseract.image_to_string(pil_clahe, config=OCR_PSM6)
+    t_ghost = pytesseract.image_to_string(pil_ghost, config=OCR_PSM6)
+
+    # Sparse scan sometimes finds off-center text better than auto layout
+    t_sparse = pytesseract.image_to_string(pil_original, config=OCR_PSM11)
+
+    candidates = [
+        ("STD", t_std, pil_std, OCR_PSM6),
+        ("CLAHE", t_clahe, pil_clahe, OCR_PSM6),
+        ("GHOST", t_ghost, pil_ghost, OCR_PSM6),
+        ("SPARSE", t_sparse, pil_original, OCR_PSM11),
+    ]
+
+    # pick best by score
+    scored = [(name, txt, img, cfg, score_text_pass(txt)) for name, txt, img, cfg in candidates]
+    best = sorted(scored, key=lambda x: x[4], reverse=True)[0]
+    best_name, best_text, best_img, best_cfg, best_score = best
+
+    # parse header from winning text
+    lines_best = split_lines(best_text)
+    header_raw, p, s, last, addr, is_interment = parse_owner_header(lines_best, target_char)
+    phone = extract_phone(best_text)
+    template_type = detect_template_type(best_text)
+
+    # Item extraction for OCR fallback: use image_to_data on std+clahe and merge unique lines
+    d_std = pytesseract.image_to_data(pil_std, config=OCR_PSM6, output_type=Output.DICT)
+    d_clahe = pytesseract.image_to_data(pil_clahe, config=OCR_PSM6, output_type=Output.DICT)
+
     raw_lines_a = group_text_lines_from_ocr(d_std)
     raw_lines_b = group_text_lines_from_ocr(d_clahe)
-    
-    strike_segs_a = detect_horizontal_strikelines(cv2.cvtColor(np.array(pil_std.convert("RGB")), cv2.COLOR_RGB2BGR))
-    strike_segs_b = detect_horizontal_strikelines(cv2.cvtColor(np.array(pil_clahe.convert("RGB")), cv2.COLOR_RGB2BGR))
-    
+
+    # Strike detection on deskewed original, not binarized
+    strike_segs = detect_horizontal_strikelines(orig_bgr)
+
     all_items = []
     seen_hashes = set()
-    
-    # Helper to process lines
-    def process_lines(lines, strikes):
-        for ln_obj in lines:
+
+    def process_lines(lines_ocr):
+        for ln_obj in lines_ocr:
             txt = ln_obj["text"]
-            if not txt: continue
-            
-            # V28.1 FIX: Use combined hash logic to ensure std/clahe duplicates are caught
-            # We normalize heavily to match "Address" from std vs "Address" from clahe
-            h = sha1_text(normalize_ws(txt))
-            if h in seen_hashes: continue
-            
-            struck = line_is_struck(ln_obj["bbox"], strikes)
-            excludable = is_excludable_item(txt)
-            cls = classify_item(txt)
-            
-            # V27: If it's a Property, extract details
-            prop_details = {"Garden":"", "Section":"", "Lot":"", "Space":""}
-            if cls["IsProperty"]:
-                prop_details = extract_property_details(txt)
-            
-            looks_item = (cls["IsProperty"] or cls["IsMemorial"] or cls["IsFuneralPreneed"] or cls["IsAtNeedFuneral"] or cls["HasRightsNotation"])
-            include = looks_item and (not struck) and (not excludable)
-            
-            rt = rights_used_total(txt)
-            
-            all_items.append({
-                "LineText": txt,
-                "StruckThrough": bool(struck),
-                "ExcludedByText": bool(excludable),
-                "Include": bool(include),
-                "IsProperty": bool(cls["IsProperty"]),
-                "IsMemorial": bool(cls["IsMemorial"]),
-                "IsFuneralPreneed": bool(cls["IsFuneralPreneed"]),
-                "IsAtNeedFuneral": bool(cls["IsAtNeedFuneral"]),
-                "IsIntermentService": bool(cls["IsIntermentService"]),
-                "RightsNotation": rt[2] if rt else "",
-                "RightsUsed": rt[0] if rt else None,
-                "RightsTotal": rt[1] if rt else None,
-                "Prop_Garden": prop_details["Garden"], 
-                "Prop_Section": prop_details["Section"],
-                "Prop_Lot": prop_details["Lot"], 
-                "Prop_Space": prop_details["Space"]
-            })
+            if not txt:
+                continue
+
+            y_bin = int(ln_obj["bbox"][1] / 20)
+            x_bin = int(ln_obj["bbox"][0] / 100)
+            h = sha1_text(normalize_ws(txt) + f"_{y_bin}_{x_bin}")
+            if h in seen_hashes:
+                continue
+
+            struck = line_is_struck(ln_obj["bbox"], strike_segs)
+            item = item_dict_from_line(txt, struck=struck)
+            all_items.append(item)
             seen_hashes.add(h)
 
-    process_lines(raw_lines_b, strike_segs_b) # Prefer CLAHE for faint items
-    process_lines(raw_lines_a, strike_segs_a) # Fill gaps with Std
-    
+    process_lines(raw_lines_b)
+    process_lines(raw_lines_a)
+
+    combined_raw = "\n".join([t_std, t_clahe, t_ghost, t_sparse])
+
     return ({
-        "OwnerName_Raw": f"{final_primary} {final_secondary}",
-        "PrimaryOwnerName": final_primary,
-        "SecondaryOwnerName": final_secondary,
-        "LastName": final_last,
-        "Phone": final_phone,
-        "Street": final_addr.get("Street", ""),
-        "City": final_addr.get("City", ""),
-        "State": final_addr.get("State", ""),
-        "ZIP": final_addr.get("ZIP", ""),
-        "AddressRaw": final_addr.get("AddressRaw", ""),
-        "RawText": t_std + "\n" + t_clahe, 
-        "RawTextHash": sha1_text(t_std + "\n" + t_clahe) # V28.1 FIX: Hash both for better dup detection
-    }, all_items)
+        "OwnerName_Raw": normalize_ws(f"{p} {s}"),
+        "PrimaryOwnerName": p,
+        "SecondaryOwnerName": s,
+        "LastName": last,
+        "Phone": phone,
+        "Street": addr.get("Street", ""),
+        "City": addr.get("City", ""),
+        "State": addr.get("State", ""),
+        "ZIP": addr.get("ZIP", ""),
+        "AddressRaw": addr.get("AddressRaw", ""),
+        "RawText": combined_raw,
+        "RawTextHash": sha1_text(combined_raw),
+        "TemplateType": template_type,
+        "TextSource": f"OCR_FALLBACK_{best_name}_S{best_score}",
+    }, all_items, is_interment)
+
 
 # -----------------------------
-# EXCEL SAFETY
+# NEIGHBOR CONTEXT (your logic retained)
 # -----------------------------
 
-def excel_safe_text(v):
-    if v is None: return ""
-    try:
-        if pd.isna(v): return ""
-    except Exception: pass
-    if isinstance(v, (int, float, np.integer, np.floating)):
-        try:
-            if np.isinf(v): return ""
-        except Exception: pass
-        return v
-    s = str(v)
-    try: s = unicodedata.normalize("NFKD", s)
-    except Exception: pass
-    s = re.sub(r"[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD]", "", s)
-    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", s)
-    s_l = s.lstrip()
-    if s_l.startswith(("=", "+", "-", "@")): s = "'" + s
-    if len(s) > EXCEL_SAFE_MAX: s = s[: (EXCEL_SAFE_MAX - len(TRUNC_SUFFIX))] + TRUNC_SUFFIX
-    return s
+def apply_neighbor_context(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for i in range(1, len(df) - 1):
+        name = str(df.at[i, 'PrimaryOwnerName'])
+        if "[MISSING" in name or (len(name) > 0 and not name[0].isalpha()):
+            prev_name = str(df.at[i - 1, 'PrimaryOwnerName'])
+            next_name = str(df.at[i + 1, 'PrimaryOwnerName'])
+            if "," in prev_name and "," in next_name:
+                prev_last = prev_name.split(",")[0].strip().upper()
+                next_last = next_name.split(",")[0].strip().upper()
+                if prev_last == next_last and prev_last:
+                    garbage = name.replace("[MISSING - CHECK PDF]", "").strip()
+                    new_name = f"{prev_last}, {garbage} [Context Fix]"
+                    df.at[i, 'PrimaryOwnerName'] = new_name
+                    df.at[i, 'LastName'] = prev_last
+    return df
 
-def make_df_excel_safe(df: pd.DataFrame) -> pd.DataFrame:
-    df2 = df.copy()
-    for c in df2.columns: df2[c] = df2[c].map(excel_safe_text)
-    return df2
 
-def choose_excel_engine() -> str:
-    try: import xlsxwriter; return "xlsxwriter"
-    except Exception: return "openpyxl"
+# -----------------------------
+# DATASET PROCESSOR
+# -----------------------------
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pdf", required=True, help="Input scanned PDF")
-    ap.add_argument("--out", required=True, help="Output Excel path")
-    ap.add_argument("--dpi", type=int, default=300, help="OCR render DPI")
-    args = ap.parse_args()
-
-    pdf_path = args.pdf
+def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
     if not os.path.exists(pdf_path):
-        print(f"PDF not found: {pdf_path}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Error: {pdf_path} not found.")
+        return
 
     target_char = None
     filename = os.path.basename(pdf_path)
     if filename and filename[0].isalpha():
         target_char = filename[0].upper()
-        # V28.1: Determine record prefix based on filename
         record_prefix = target_char
     else:
-        record_prefix = "A" # Default
-    
-    print(f"[Info] Detected Target Letter from filename: '{target_char}' (Prefix: {record_prefix})")
+        record_prefix = "A"
 
-    # V28.1: Optimization - Removed thumbnail rendering pass to save time
-    # We will just count pages directly or rely on tqdm
-    # But pdf2image needs to know page count for range loop usually, 
-    # easiest way without rendering is `pdfinfo` but that requires poppler-utils cli.
-    # We will stick to the thumbnail count for reliability unless it's too slow.
-    # Actually, let's keep it for safety.
-    thumbs = convert_from_path(pdf_path, dpi=50)
-    page_count = len(thumbs)
-    print(f"[Checkpoint] Detected pages: {page_count}")
+    print(f"\n[Info] Processing '{filename}' | Target: '{target_char}' | Prefix: {record_prefix}")
+
+    try:
+        info = pdfinfo_from_path(pdf_path)
+        page_count = info["Pages"]
+        print(f"[Info] Quick page count: {page_count}")
+    except Exception:
+        print("[Warn] pdfinfo failed, falling back to render...")
+        thumbs = convert_from_path(pdf_path, dpi=50)
+        page_count = len(thumbs)
 
     owners_rows = []
     items_rows = []
+    interment_rows = []
 
-    for p in tqdm(range(page_count), desc="Hybrid Scan Pages", unit="page"):
-        owner_data, items_data = process_page_hybrid(pdf_path, p, args.dpi, target_char)
-        
-        # V28.1 FIX: Dynamic Record ID
+    for p in tqdm(range(page_count), desc=f"Scanning {filename}", unit="page"):
+        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char)
+
         rec_id = f"{record_prefix}-P{p+1:04d}"
-        
         owner_data["OwnerRecordID"] = rec_id
-        owner_data["SourceFile"] = os.path.basename(pdf_path)
+        owner_data["SourceFile"] = filename
         owner_data["PageNumber"] = p + 1
-        
-        parts = [
-            safe_upper(owner_data["PrimaryOwnerName"]),
-            safe_upper(owner_data["SecondaryOwnerName"]),
-            safe_upper(owner_data["Street"]),
-            (owner_data["ZIP"] or "")
-        ]
-        owner_data["OwnerGroupKey"] = sha1_text("|".join(parts))[:12]
-        
-        owners_rows.append(owner_data)
-        
-        for it in items_data:
-            it["OwnerRecordID"] = rec_id
-            it["SourceFile"] = os.path.basename(pdf_path)
-            it["Page"] = p + 1
-            items_rows.append(it)
+
+        if is_interment:
+            interment_rows.append(owner_data)
+        else:
+            parts = [
+                safe_upper(owner_data.get("PrimaryOwnerName", "")),
+                safe_upper(owner_data.get("SecondaryOwnerName", "")),
+                safe_upper(owner_data.get("Street", "")),
+                (owner_data.get("ZIP", "") or "")
+            ]
+            owner_data["OwnerGroupKey"] = sha1_text("|".join(parts))[:12]
+            owners_rows.append(owner_data)
+
+            for it in items_data:
+                it["OwnerRecordID"] = rec_id
+                it["SourceFile"] = filename
+                it["Page"] = p + 1
+                items_rows.append(it)
 
     owners_df = pd.DataFrame(owners_rows)
     items_df = pd.DataFrame(items_rows)
+    interment_df = pd.DataFrame(interment_rows)
+
+    owners_df = apply_neighbor_context(owners_df)
 
     dup = owners_df.groupby("RawTextHash").size().reset_index(name="Count")
     dup = dup[dup["Count"] > 1]
@@ -829,45 +1203,62 @@ def main():
         has_memorial = bool(group["IsMemorial"].any())
         has_pn = bool(group["IsFuneralPreneed"].any())
         has_an = bool(group["IsAtNeedFuneral"].any())
-        
+
         memorial_lines = group[group["IsMemorial"] == True]["LineText"].tolist()
         pn_lines = group[group["IsFuneralPreneed"] == True]["LineText"].tolist()
         an_lines = group[group["IsAtNeedFuneral"] == True]["LineText"].tolist()
         property_lines = group[group["IsProperty"] == True]["LineText"].tolist()
 
         likely_burials = compute_likely_burials(group.to_dict("records"))
-        
-        owner_row = owners_df[owners_df["OwnerRecordID"] == group.name].iloc[0]
-        total_owners = total_owners_on_file(owner_row["PrimaryOwnerName"], owner_row["SecondaryOwnerName"])
+
+        matching_owners = owners_df[owners_df["OwnerRecordID"] == group.name]
+        if matching_owners.empty:
+            total_owners = 1
+        else:
+            owner_row = matching_owners.iloc[0]
+            total_owners = total_owners_on_file(owner_row["PrimaryOwnerName"], owner_row["SecondaryOwnerName"])
+
         living_exists = True if (int(likely_burials) < int(total_owners)) else False
 
         pn_status = "TRUE" if has_pn else "FALSE"
         if total_owners == 2 and has_pn:
             policy_like = [ln for ln in pn_lines if re.search(r"\bpolicy\b", ln, re.IGNORECASE)]
-            if len(policy_like) == 1: pn_status = "PARTIAL"
+            if len(policy_like) == 1:
+                pn_status = "PARTIAL"
 
         needs_memorial = bool(has_property and (not has_memorial))
         needs_pn = bool(has_property and (pn_status in ["FALSE", "PARTIAL"]))
         spaces_only_prime = bool(has_property and (not has_memorial) and (pn_status in ["FALSE", "PARTIAL"]) and living_exists)
         survivor_opp = bool((total_owners == 2) and (len(an_lines) == 1) and (pn_status in ["FALSE", "PARTIAL"]) and has_property and living_exists)
-        
+
         return pd.Series({
-            "HasProperty": has_property, "HasMemorial": has_memorial, "HasAtNeedFuneral": has_an,
-            "HasFuneralPreneedPlanStatus": pn_status, "LikelyBurials": int(likely_burials),
-            "TotalOwnersOnFile": int(total_owners), "LivingOwnerExists": bool(living_exists),
-            "NeedsMemorial": bool(needs_memorial), "NeedsPNFuneral": bool(needs_pn),
-            "SpacesOnly_PRIME": bool(spaces_only_prime), "SurvivorSpouse_Opportunity": bool(survivor_opp),
-            "MemorialEvidence": " || ".join(memorial_lines[:3]), "PNFuneralEvidence": " || ".join(pn_lines[:3]),
-            "AtNeedEvidence": " || ".join(an_lines[:3]), "PropertyEvidence": " || ".join(property_lines[:3]),
+            "HasProperty": has_property,
+            "HasMemorial": has_memorial,
+            "HasAtNeedFuneral": has_an,
+            "HasFuneralPreneedPlanStatus": pn_status,
+            "LikelyBurials": int(likely_burials),
+            "TotalOwnersOnFile": int(total_owners),
+            "LivingOwnerExists": bool(living_exists),
+            "NeedsMemorial": bool(needs_memorial),
+            "NeedsPNFuneral": bool(needs_pn),
+            "SpacesOnly_PRIME": bool(spaces_only_prime),
+            "SurvivorSpouse_Opportunity": bool(survivor_opp),
+            "MemorialEvidence": " || ".join(memorial_lines[:3]),
+            "PNFuneralEvidence": " || ".join(pn_lines[:3]),
+            "AtNeedEvidence": " || ".join(an_lines[:3]),
+            "PropertyEvidence": " || ".join(property_lines[:3]),
         })
 
     if len(inc) > 0:
-        try: owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner, include_groups=False).reset_index()
-        except TypeError: owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner).reset_index()
-    else: owner_flags = pd.DataFrame(columns=["OwnerRecordID"])
+        try:
+            owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner, include_groups=False).reset_index()
+        except TypeError:
+            owner_flags = inc.groupby("OwnerRecordID").apply(agg_owner).reset_index()
+    else:
+        owner_flags = pd.DataFrame(columns=["OwnerRecordID"])
 
     owners_master = owners_df.merge(owner_flags, on="OwnerRecordID", how="left")
-    
+
     defaults = {
         "HasProperty": False, "HasMemorial": False, "HasAtNeedFuneral": False,
         "HasFuneralPreneedPlanStatus": "FALSE", "LikelyBurials": 0, "TotalOwnersOnFile": 1,
@@ -876,27 +1267,35 @@ def main():
         "MemorialEvidence": "", "PNFuneralEvidence": "", "AtNeedEvidence": "", "PropertyEvidence": "",
     }
     for col, default in defaults.items():
-        if col in owners_master.columns: owners_master[col] = owners_master[col].fillna(default)
+        if col in owners_master.columns:
+            owners_master[col] = owners_master[col].fillna(default)
+
+    if "ZIP" in owners_master.columns:
+        owners_master["ZIP"] = owners_master["ZIP"].astype(str)
 
     list_memorial = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasMemorial"] != True) & (owners_master["LivingOwnerExists"] == True)].copy()
     list_pn = owners_master[(owners_master["HasProperty"] == True) & (owners_master["HasFuneralPreneedPlanStatus"].isin(["FALSE", "PARTIAL"])) & (owners_master["LivingOwnerExists"] == True)].copy()
     list_prime = owners_master[owners_master["SpacesOnly_PRIME"] == True].copy()
     list_survivor = owners_master[owners_master["SurvivorSpouse_Opportunity"] == True].copy()
 
-    # V28.1 FIX: Correctly count duplicates
     dup_count = len(possible_dups)
 
     stats = pd.DataFrame([{
-        "GeneratedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "SourceFile": os.path.basename(pdf_path),
-        "PagesDetected": page_count, "OwnerRecords": len(owners_master), 
-        "PossibleDuplicateScans": dup_count, # V28.1 FIX
+        "GeneratedAt": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "SourceFile": filename,
+        "PagesDetected": page_count,
+        "OwnerRecords": len(owners_master),
+        "IntermentRecordsFound": len(interment_df),
+        "PossibleDuplicateScans": dup_count,
         "Owners_HasProperty": int((owners_master["HasProperty"] == True).sum()),
         "Owners_HasMemorial": int((owners_master["HasMemorial"] == True).sum()),
         "Owners_PN_TRUE": int((owners_master["HasFuneralPreneedPlanStatus"] == "TRUE").sum()),
         "Owners_PN_PARTIAL": int((owners_master["HasFuneralPreneedPlanStatus"] == "PARTIAL").sum()),
         "Owners_PN_FALSE": int((owners_master["HasFuneralPreneedPlanStatus"] == "FALSE").sum()),
-        "LIST_Memorial_Letter": len(list_memorial), "LIST_PN_Funeral_Letter": len(list_pn),
-        "LIST_SpacesOnly_PRIME": len(list_prime), "LIST_SurvivorSpouse": len(list_survivor),
+        "LIST_Memorial_Letter": len(list_memorial),
+        "LIST_PN_Funeral_Letter": len(list_pn),
+        "LIST_SpacesOnly_PRIME": len(list_prime),
+        "LIST_SurvivorSpouse": len(list_survivor),
     }])
 
     owners_master_safe = make_df_excel_safe(owners_master)
@@ -907,10 +1306,11 @@ def main():
     list_survivor_safe = make_df_excel_safe(list_survivor)
     stats_safe = make_df_excel_safe(stats)
 
-    out_path = args.out
+    interment_safe = make_df_excel_safe(interment_df) if not interment_df.empty else pd.DataFrame()
+
     tmp_path = out_path + ".tmp.xlsx"
     engine = choose_excel_engine()
-    print(f"Writing Excel with engine={engine} to temp file: {tmp_path} ...")
+    print(f"Writing Excel to: {out_path} ...")
 
     with pd.ExcelWriter(tmp_path, engine=engine) as xw:
         owners_master_safe.to_excel(xw, index=False, sheet_name="Owners_Master")
@@ -921,17 +1321,57 @@ def main():
         list_survivor_safe.to_excel(xw, index=False, sheet_name="LIST_SurvivorSpouse_Opp")
         possible_dups_safe.to_excel(xw, index=False, sheet_name="PossibleDuplicateScans")
         stats_safe.to_excel(xw, index=False, sheet_name="Stats")
+        if not interment_safe.empty:
+            interment_safe.to_excel(xw, index=False, sheet_name="LIST_Refile_IntermentRecords")
 
-    try: import openpyxl; _ = openpyxl.load_workbook(tmp_path, read_only=True)
-    except Exception as e:
-        print("\n❌ ERROR: The workbook written could not be re-opened for verification."); print(f"Details: {e}"); sys.exit(1)
-
-    try: os.replace(tmp_path, out_path)
+    try:
+        os.replace(tmp_path, out_path)
     except PermissionError:
-        print(f"\n❌ ERROR: Could not overwrite '{out_path}'. It may be open in Excel."); sys.exit(1)
+        print(f"\n❌ ERROR: Could not overwrite '{out_path}'. It may be open in Excel.")
 
-    print("\nDONE ✅"); print(f"Output written to: {out_path}")
-    print("Key sheets: Owners_Master, LIST_SpacesOnly_PRIME, LIST_Memorial_Letter, LIST_PN_Funeral_Letter")
+
+# -----------------------------
+# CLI
+# -----------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pdf", help="Input scanned PDF")
+    ap.add_argument("--out", help="Output Excel path")
+    ap.add_argument("--dpi", type=int, default=300, help="OCR render DPI (fallback only)")
+    args, _ = ap.parse_known_args()
+
+    if args.pdf:
+        out = args.out if args.out else args.pdf.replace(".pdf", ".xlsx")
+        process_dataset(args.pdf, out, args.dpi)
+        print("\nDONE ✅")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    search_pattern = os.path.join(script_dir, "* (all).pdf")
+    pdf_files = sorted(glob.glob(search_pattern))
+
+    if not pdf_files:
+        print(f"❌ No files matching pattern 'X (all).pdf' found in: {script_dir}")
+        print("Make sure the PDF files are in the same folder as this script.")
+        cwd_files = sorted(glob.glob("* (all).pdf"))
+        if cwd_files:
+            print(f"⚠️ Found {len(cwd_files)} files in current working directory. Processing those instead.")
+            pdf_files = cwd_files
+        else:
+            return
+
+    print(f"✅ Found {len(pdf_files)} PDF(s) to process: {[os.path.basename(f) for f in pdf_files]}")
+
+    for pdf_path in pdf_files:
+        filename = os.path.basename(pdf_path)
+        letter = filename.split(' ')[0]
+        output_dir = os.path.dirname(pdf_path)
+        out_path = os.path.join(output_dir, f"OwnerCards_{letter}_Output.xlsx")
+        process_dataset(pdf_path, out_path, args.dpi)
+
+    print("\nALL FILES PROCESSED SUCCESSFULLY ✅")
+
 
 if __name__ == "__main__":
     main()
