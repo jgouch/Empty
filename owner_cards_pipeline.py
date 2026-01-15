@@ -556,11 +556,64 @@ def clean_address_line(line: str) -> str:
         line = line[:m_date.start()]
     return normalize_ws(line)
 
+def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
+    if not line:
+        return None
+    z, st = extract_zip_state(line)
+    if not (z and st):
+        return None
+    if not re.search(STREET_START_RE, line):
+        return None
+
+    state_match = re.search(US_STATE_RE, line, re.IGNORECASE)
+    if not state_match:
+        return None
+
+    before_state = normalize_ws(line[:state_match.start()].rstrip(",")).strip()
+    if not before_state:
+        return None
+
+    if "," in before_state:
+        street_part, city_part = before_state.rsplit(",", 1)
+        street = normalize_ws(street_part)
+        city = normalize_ws(city_part)
+    else:
+        addr_match = re.match(
+            r"^(\d+\s+.+?\b(?:road|rd|street|st|avenue|ave|drive|dr|lane|ln|court|ct|blvd|boulevard|pkwy|parkway|hwy|highway|trl|trail|cir|circle|pl|place|po\s*box|box)\.?)\s+(.*)$",
+            before_state,
+            re.IGNORECASE,
+        )
+        if addr_match:
+            street = normalize_ws(addr_match.group(1))
+            city = normalize_ws(addr_match.group(2))
+        else:
+            street = before_state
+            city = ""
+
+    return {
+        "Street": street,
+        "City": city,
+        "State": st,
+        "ZIP": z,
+        "CityStateZip": line,
+    }
+
 def parse_best_address(lines: List[str]) -> Dict:
     candidates = []
     for i, line in enumerate(lines):
         z, st = extract_zip_state(line)
         if z and st:
+            inline = parse_inline_address_line(line)
+            if inline:
+                candidates.append({
+                    "Index": i,
+                    "Street": inline["Street"],
+                    "CityStateZip": inline["CityStateZip"],
+                    "State": inline["State"],
+                    "ZIP": inline["ZIP"],
+                    "Score": 90 if inline["City"] else 70,
+                })
+                continue
             prev_idx = i - 1
             street_candidate = lines[prev_idx] if prev_idx >= 0 else ""
             street_candidate = clean_address_line(street_candidate)
