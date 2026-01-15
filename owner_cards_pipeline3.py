@@ -189,6 +189,8 @@ RE_XFER = compile_any(TRANSFER_CANCEL_PATTERNS)
 RE_NAME_BLACKLIST = compile_any(NAME_BLACKLIST)
 RE_NAME_NOISE = compile_any(NAME_NOISE_PATTERNS)
 RE_ADDR_BLOCK = compile_any(ADDRESS_BLOCKERS)
+RE_NAME_GEO = compile_any([r"\bSermon\b", r"\bChapel\b", r"\bGarden\b", r"\bSection\b", r"\bMount\b", r"\bMt\.?\b"])
+RE_NAME_GENDER = compile_any([r"\bSex\b", r"\bMale\b", r"\bFemale\b", r"\bGrave\b"])
 
 
 # -----------------------------
@@ -233,6 +235,12 @@ PHONE_PATTERN = re.compile(
 def _digits_only(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
+def _strip_phone_extension(raw: str) -> str:
+    if not raw:
+        return ""
+    parts = re.split(r"\b(?:ext\.?|x)\b", raw, maxsplit=1, flags=re.IGNORECASE)
+    return parts[0]
+
 def _normalize_phone_digits(d: str) -> Tuple[str, bool, bool]:
     """Return (normalized, has_area, valid) for 10-digit or 7-digit; handles leading 1."""
     d = d or ""
@@ -260,7 +268,8 @@ def extract_phone_fields(full_text: str, lines: List[str]) -> Dict[str, object]:
     seen = set()
     candidates = []
     for raw in matches:
-        d = _digits_only(raw)
+        raw_main = _strip_phone_extension(raw)
+        d = _digits_only(raw_main)
         if not d or d in seen:
             continue
         seen.add(d)
@@ -480,6 +489,14 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
             return True
     return False
 
+def detect_strike_lines_on_page(pdf_path: str, page_index: int, dpi: int) -> List[Tuple[int, int, int, int]]:
+    imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
+    if not imgs:
+        return []
+    pil_img = imgs[0].convert("RGB")
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    return detect_horizontal_strikelines(img_bgr)
+
 
 # -----------------------------
 # TEXT LAYER (Adobe OCR)
@@ -597,11 +614,9 @@ def clean_name_line(line: str, target_char: Optional[str] = None, aggressive: bo
         if re.match(r"^\d", line):
             return ""
 
-    if matches_any(line, [re.compile(p, re.IGNORECASE) for p in
-                          [r"\bSermon\b", r"\bChapel\b", r"\bGarden\b", r"\bSection\b", r"\bMount\b", r"\bMt\.?\b"]]):
+    if matches_any(line, RE_NAME_GEO):
         return ""
-    if matches_any(line, [re.compile(p, re.IGNORECASE) for p in
-                          [r"\bSex\b", r"\bMale\b", r"\bFemale\b", r"\bGrave\b"]]):
+    if matches_any(line, RE_NAME_GENDER):
         return ""
 
     line_upper = line.upper()
@@ -849,7 +864,7 @@ def parse_owner_header(lines: List[str], target_char: Optional[str] = None) -> T
     if "," in primary:
         last_name = primary.split(",")[0].strip()
     elif " " in primary:
-        last_name = primary.split(" ")[0].strip()
+        last_name = primary.split(" ")[-1].strip()
     else:
         last_name = primary
 
@@ -959,7 +974,7 @@ def parse_items_from_text(lines: List[str], template_type: str) -> List[Dict]:
                 continue
             if not in_items:
                 continue
-            if "OWNER ID" in u or "OWNER SINCE" in u:
+            if u in {"OWNER ID", "OWNER SINCE"}:
                 break
             txt = normalize_ws(ln)
             if not txt:
@@ -1030,6 +1045,11 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         # v43 rule: reject if name flagged missing / doesn't start with target
         if p and "[MISSING" not in p:
             use_text_layer = True
+
+    if use_text_layer:
+        strike_segs = detect_strike_lines_on_page(pdf_path, page_index, dpi=150)
+        if strike_segs:
+            use_text_layer = False
 
     if use_text_layer:
         phone_fields = extract_phone_fields(txt, lines)
@@ -1162,7 +1182,7 @@ def compute_likely_burials(items: List[Dict]) -> int:
         if not it.get("IsProperty", False):
             continue
         txt = (it.get("LineText", "") or "").upper()
-        if re.search(r"\bX\b", txt) or re.search(r"\bUSED\b", txt):
+        if re.search(r"\bUSED\b", txt) or re.search(r"\bX\b.*\b(LOT|SPACE|GRAVE|CRYPT|SECTION|SEC|BLOCK|BLK)\b", txt):
             used_counts.append(1)
 
         ru = it.get("RightsUsed", None)
@@ -1254,7 +1274,7 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300):
         dup = dup[dup["Count"] > 1]
         possible_dups = owners_df.merge(dup, on="RawTextHash", how="inner").sort_values(["RawTextHash", "PageNumber"]) if not dup.empty else pd.DataFrame()
 
-    inc = items_df[items_df.get("Include", False) == True].copy() if not items_df.empty else pd.DataFrame()
+    inc = items_df[items_df["Include"] == True].copy() if (not items_df.empty and "Include" in items_df.columns) else pd.DataFrame()
 
     def agg_owner(group: pd.DataFrame) -> pd.Series:
         has_property = bool(group["IsProperty"].any())
