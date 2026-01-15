@@ -612,7 +612,8 @@ def get_header_candidate(lines: List[str], addr_idx: Optional[int], target_char:
     clean_header = []
     top = lines[:40]
     search_lines = top[:addr_idx] if (addr_idx is not None and addr_idx > 0) else top[:8]
-    search_iter = range(len(search_lines) - 1, -1, -1) if addr_idx else range(len(search_lines))
+    has_addr_context = addr_idx is not None and addr_idx > 0
+    search_iter = range(len(search_lines) - 1, -1, -1) if has_addr_context else range(len(search_lines))
 
     for i in search_iter:
         ln = search_lines[i]
@@ -625,7 +626,7 @@ def get_header_candidate(lines: List[str], addr_idx: Optional[int], target_char:
         if not ln_clean or is_gibberish(ln_clean):
             continue
 
-        if addr_idx:
+        if has_addr_context:
             clean_header.insert(0, ln_clean)
         else:
             clean_header.append(ln_clean)
@@ -935,8 +936,10 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
 def apply_neighbor_context(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     for i in range(1, len(df) - 1):
-        name = str(df.at[i, 'PrimaryOwnerName'])
-        if "[MISSING" in name or (len(name) > 0 and not name[0].isalpha()):
+        raw_name = df.at[i, 'PrimaryOwnerName']
+        name = "" if pd.isna(raw_name) else str(raw_name)
+        missing_name = not name.strip() or name.strip().lower() == "nan"
+        if missing_name or "[MISSING" in name or (len(name) > 0 and not name[0].isalpha()):
             prev_name = str(df.at[i-1, 'PrimaryOwnerName'])
             next_name = str(df.at[i+1, 'PrimaryOwnerName'])
             if "," in prev_name and "," in next_name:
