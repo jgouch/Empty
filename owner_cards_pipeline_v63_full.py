@@ -11,9 +11,9 @@ This version implements the issues you identified:
 Also includes the Py3.14 regex fix (hyphen placed at end in character class).
 
 Run:
-  python3 owner_cards_pipeline_v45_py314.py
+  python3 owner_cards_pipeline_v63_full.py
   or
-  python3 owner_cards_pipeline_v45_py314.py --pdf "B (all).pdf" --out "OwnerCards_B_Output.xlsx"
+  python3 owner_cards_pipeline_v63_full.py --pdf "B (all).pdf" --out "OwnerCards_B_Output.xlsx"
 
 Deps (Mac):
   brew install poppler tesseract
@@ -28,6 +28,7 @@ import re
 import unicodedata
 from datetime import datetime
 import difflib
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
@@ -866,6 +867,46 @@ def preprocess_ghost(pil_img: Image.Image) -> Image.Image:
     bin_img = cv2.dilate(bin_img, kernel, iterations=1)
     return Image.fromarray(bin_img)
 
+
+# --- Additional preprocessing for hard scans (illumination correction + sharpening) ---
+def preprocess_shadow_correct(pil_img: Image.Image) -> Image.Image:
+    """Normalize uneven illumination/shadows to help OCR on faint scans."""
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    bg = cv2.medianBlur(gray, 31)
+    bg = np.clip(bg, 1, 255)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm = cv2.bilateralFilter(norm, 9, 50, 50)
+    bin_img = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 11)
+    bin_img = ensure_dark_text_on_white(bin_img)
+    return Image.fromarray(bin_img)
+
+
+def unsharp_mask(pil_img: Image.Image, amount: float = 1.2, radius: int = 1) -> Image.Image:
+    """Simple unsharp mask to strengthen faint strokes without over-bolding."""
+    img = np.array(pil_img.convert('L'))
+    blur = cv2.GaussianBlur(img, (0, 0), radius)
+    sharp = cv2.addWeighted(img, 1.0 + amount, blur, -amount, 0)
+    sharp = np.clip(sharp, 0, 255).astype(np.uint8)
+    return Image.fromarray(sharp)
+
+
+def crop_region(pil_img: Image.Image, top: float, bottom: float) -> tuple[Image.Image, int]:
+    """Crop a vertical region [top,bottom] fractions. Returns (crop, y_offset_px)."""
+    w, h = pil_img.size
+    y1 = int(h * top)
+    y2 = int(h * bottom)
+    y2 = max(y2, y1 + 1)
+    return pil_img.crop((0, y1, w, y2)), y1
+
+
+def crop_header(pil_img: Image.Image) -> tuple[Image.Image, int]:
+    return crop_region(pil_img, 0.0, HEADER_CROP_RATIO)
+
+
+def crop_items(pil_img: Image.Image) -> tuple[Image.Image, int]:
+    return crop_region(pil_img, ITEMS_START_RATIO, 1.0)
+
 def group_text_lines_from_ocr(data: Dict) -> List[Dict]:
     n = len(data.get("text", []))
     words = []
@@ -1545,7 +1586,7 @@ def score_text_pass(txt: str) -> int:
 # -----------------------------
 
 # --- Header-only OCR ensemble (for rotation + better name/address) ---
-def ocr_header_ensemble(pil_page: Image.Image, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True) -> tuple[str, dict]:
+def ocr_header_ensemble(pil_page: Image.Image, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, alt_ocr: str = "ocrmac_then_kraken") -> tuple[str, dict]:
     header_img, _ = crop_header(pil_page)
     scales = [1.0, 2.0, 3.0]
     variants = []
@@ -1574,39 +1615,59 @@ def ocr_header_ensemble(pil_page: Image.Image, kraken_model: str = '', kraken_bi
                 best_score = sc
                 best_text = t
                 best_name = f"TESS_{tag}_PSM{psm}_S{sc}"
-    t_vision = try_ocrmac_text(header_img, recognition_level='accurate', framework='vision', language_preference=['en-US'])
-    if t_vision:
-        used['ocrmac_vision'] = True
-        sc = score_header_text(t_vision)
-        if sc > best_score:
-            best_score = sc
-            best_text = t_vision
-            best_name = f"OCRMAC_VISION_S{sc}"
-    if allow_livetext:
-        t_lt = try_ocrmac_text(header_img, framework='livetext', language_preference=['en-US'])
-        if t_lt:
-            used['ocrmac_livetext'] = True
-            sc = score_header_text(t_lt)
-            if sc > best_score:
-                best_score = sc
-                best_text = t_lt
-                best_name = f"OCRMAC_LIVETEXT_S{sc}"
-    if best_score < 45 and kraken_model:
+    alt_mode = (alt_ocr or "").strip().lower()
+    allow_alt = alt_mode != "none"
+    prefer_kraken = alt_mode == "kraken_then_ocrmac"
+
+    best = {"score": best_score, "text": best_text, "name": best_name}
+
+    def try_ocrmac():
+        if not allow_alt:
+            return
+        t_vision = try_ocrmac_text(header_img, recognition_level='accurate', framework='vision', language_preference=['en-US'])
+        if t_vision:
+            used['ocrmac_vision'] = True
+            sc = score_header_text(t_vision)
+            if sc > best["score"]:
+                best.update({"score": sc, "text": t_vision, "name": f"OCRMAC_VISION_S{sc}"})
+        if allow_livetext:
+            t_lt = try_ocrmac_text(header_img, framework='livetext', language_preference=['en-US'])
+            if t_lt:
+                used['ocrmac_livetext'] = True
+                sc = score_header_text(t_lt)
+                if sc > best["score"]:
+                    best.update({"score": sc, "text": t_lt, "name": f"OCRMAC_LIVETEXT_S{sc}"})
+
+    def try_kraken():
+        if not allow_alt or not kraken_model:
+            return
         t_k = try_kraken_text(header_img, model_path=kraken_model, kraken_bin=kraken_bin, kraken_python=kraken_python)
         if t_k:
             used['kraken'] = True
             sc = score_header_text(t_k)
-            if sc > best_score:
-                best_score = sc
-                best_text = t_k
-                best_name = f"KRAKEN_S{sc}"
+            if sc > best["score"]:
+                best.update({"score": sc, "text": t_k, "name": f"KRAKEN_S{sc}"})
+
+    if prefer_kraken:
+        if best["score"] < 45:
+            try_kraken()
+        if best["score"] < 45:
+            try_ocrmac()
+    else:
+        try_ocrmac()
+        if best["score"] < 45:
+            try_kraken()
+
+    best_score = best["score"]
+    best_text = best["text"]
+    best_name = best["name"]
     meta = {'best': best_name, 'score': best_score, **used}
     return best_text, meta
 
 # PAGE PROCESSOR
 # -----------------------------
 
-def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str], reader: Optional[PdfReader] = None, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_sections: Optional[List[str]] = None) -> Tuple[Dict, List[Dict], bool]:
+def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional[str], reader: Optional[PdfReader] = None, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_sections: Optional[List[str]] = None, alt_ocr: str = "ocrmac_then_kraken") -> Tuple[Dict, List[Dict], bool]:
     """Returns (owner_dict, items_list, is_interment)."""
 
     # TEXT LAYER FIRST
@@ -1661,7 +1722,14 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
     pil_original = Image.fromarray(cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB))
 
     # --- v63: Header-targeted OCR ensemble (top region) ---
-    header_text, header_meta = ocr_header_ensemble(pil_original, kraken_model=kraken_model, kraken_bin=kraken_bin, kraken_python=kraken_python, allow_livetext=allow_livetext)
+    header_text, header_meta = ocr_header_ensemble(
+        pil_original,
+        kraken_model=kraken_model,
+        kraken_bin=kraken_bin,
+        kraken_python=kraken_python,
+        allow_livetext=allow_livetext,
+        alt_ocr=alt_ocr,
+    )
 
     pil_std = preprocess_standard(pil_original)
     pil_clahe = preprocess_clahe(pil_original)
@@ -1762,7 +1830,7 @@ def compute_likely_burials(items: List[Dict]) -> int:
 # DATASET PROCESSOR
 # -----------------------------
 
-def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_path: str = ''):
+def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: str = '', kraken_bin: str = 'kraken', kraken_python: str = '', allow_livetext: bool = True, facts_path: str = '', alt_ocr: str = "ocrmac_then_kraken"):
     facts_sections = load_facts_sections(facts_path) if facts_path else []
     if not os.path.exists(pdf_path):
         print(f"Error: {pdf_path} not found.")
@@ -1789,7 +1857,19 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
     interment_rows: List[Dict] = []
 
     for p in tqdm(range(page_count), desc=f"Scanning {filename}", unit="page"):
-        owner_data, items_data, is_interment = process_page(pdf_path, p, dpi, target_char, reader=reader, kraken_model=kraken_model, kraken_bin=kraken_bin, kraken_python=kraken_python, allow_livetext=allow_livetext, facts_sections=facts_sections)
+        owner_data, items_data, is_interment = process_page(
+            pdf_path,
+            p,
+            dpi,
+            target_char,
+            reader=reader,
+            kraken_model=kraken_model,
+            kraken_bin=kraken_bin,
+            kraken_python=kraken_python,
+            allow_livetext=allow_livetext,
+            facts_sections=facts_sections,
+            alt_ocr=alt_ocr,
+        )
 
         rec_id = f"{record_prefix}-P{p+1:04d}"
         owner_data["OwnerRecordID"] = rec_id
@@ -1992,6 +2072,7 @@ def main():
     ap.add_argument("--kraken-python", default="/Users/john/.local/pipx/venvs/kraken/bin/python", help="Kraken Py3.11 env python; used to locate venv kraken executable")
     ap.add_argument("--no-livetext", action="store_true", help="Disable ocrmac LiveText backend")
     ap.add_argument("--alt-ocr", default="ocrmac_then_kraken", help="Alternate OCR order (last resort): ocrmac_then_kraken|kraken_then_ocrmac|none")
+    ap.add_argument("--facts", default="", help="Optional: FaCTS inventory export (.xlsx) for section validation")
     args, _ = ap.parse_known_args()
     # --- Drag/drop friendly: positional PDF/env defaults/auto-detect ---
     if (not args.pdf) and getattr(args, "pdf_positional", None):
@@ -2015,7 +2096,17 @@ def main():
 
     if args.pdf:
         out = args.out if args.out else args.pdf.replace(".pdf", ".xlsx")
-        process_dataset(args.pdf, out, args.dpi, kraken_model=getattr(args,"kraken_model", ""), kraken_bin=getattr(args,"kraken_bin","kraken"), kraken_python=getattr(args,"kraken_python", ""), allow_livetext=(not getattr(args,"no_livetext", False)), facts_path=args.facts)
+        process_dataset(
+            args.pdf,
+            out,
+            args.dpi,
+            kraken_model=getattr(args, "kraken_model", ""),
+            kraken_bin=getattr(args, "kraken_bin", "kraken"),
+            kraken_python=getattr(args, "kraken_python", ""),
+            allow_livetext=(not getattr(args, "no_livetext", False)),
+            facts_path=args.facts,
+            alt_ocr=getattr(args, "alt_ocr", "ocrmac_then_kraken"),
+        )
         return
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2031,7 +2122,17 @@ def main():
         filename = os.path.basename(pdf_path)
         letter = filename.split(" ")[0]
         out_path = os.path.join(os.path.dirname(pdf_path), f"OwnerCards_{letter}_Output.xlsx")
-        process_dataset(pdf_path, out_path, dpi=args.dpi, kraken_model=getattr(args,"kraken_model", ""), kraken_bin=getattr(args,"kraken_bin","kraken"), kraken_python=getattr(args,"kraken_python", ""), allow_livetext=(not getattr(args,"no_livetext", False)), facts_path=args.facts)
+        process_dataset(
+            pdf_path,
+            out_path,
+            dpi=args.dpi,
+            kraken_model=getattr(args, "kraken_model", ""),
+            kraken_bin=getattr(args, "kraken_bin", "kraken"),
+            kraken_python=getattr(args, "kraken_python", ""),
+            allow_livetext=(not getattr(args, "no_livetext", False)),
+            facts_path=args.facts,
+            alt_ocr=getattr(args, "alt_ocr", "ocrmac_then_kraken"),
+        )
 
 
 if __name__ == "__main__":
