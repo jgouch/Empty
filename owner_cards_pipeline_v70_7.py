@@ -2621,7 +2621,7 @@ def process_dataset(pdf_path: str, out_path: str, dpi: int = 300, kraken_model: 
             possible_dups_safe.to_excel(xw, index=False, sheet_name="PossibleDuplicateScans")
         stats_safe.to_excel(xw, index=False, sheet_name="Stats")
         if 'debug_df' in locals() and isinstance(debug_df, pd.DataFrame) and (not debug_df.empty):
-            make_df_excel_safe(debug_df).to_excel(xw, index=False, sheet_name='PropertyCandidates_NotClassified')
+            make_df_excel_safe(debug_df).to_excel(xw, index=False, sheet_name='PropCand_NotClass')
         if not interment_safe.empty:
             interment_safe.to_excel(xw, index=False, sheet_name="LIST_Refile_IntermentRecords")
         if not phone_ex_safe.empty:
