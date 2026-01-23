@@ -2178,6 +2178,7 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
     if not line:
         return None
     line2 = fix_state_ocr_tokens(line)
+    line2 = normalize_zip_candidates(line2)
     # Strip common labels that can block street-start detection
     line2 = re.sub(r"^\s*(address|addr|mailing address)\s*[:\-]\s*", "", line2, flags=re.IGNORECASE)
     line2 = line2.lstrip(" ,")
@@ -2232,6 +2233,8 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
                 else:
                     street = before_state
                     city = ""
+
+    st = normalize_state_token(st, city, z)
 
     return {
         "Street": street,
