@@ -2300,7 +2300,10 @@ def line_is_struck(line_bbox: Tuple[int, int, int, int], strike_segs: List[Tuple
 
 
 def render_page(pdf_path: str, page_index: int, dpi: int) -> Optional[Image.Image]:
-    imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
+    try:
+        imgs = convert_from_path(pdf_path, dpi=dpi, first_page=page_index + 1, last_page=page_index + 1)
+    except Exception:
+        return None
     if not imgs:
         return None
     return imgs[0].convert("RGB")
@@ -2473,6 +2476,20 @@ def parse_inline_address_line(line: str) -> Optional[Dict[str, str]]:
                 if len(parts) >= 3 and parts[-1].upper() not in DIRECTIONAL_TOKENS:
                     street = " ".join(parts[:-1])
                     city = parts[-1]
+                elif len(parts) >= 4:
+                    maybe_city = parts[-2:]
+                    street_tokens = parts[:-2]
+                    street_upper = {tok.rstrip(".").upper() for tok in street_tokens}
+                    if (
+                        street_tokens
+                        and (street_upper & STREET_SUFFIXES or re.match(r"^\d", street_tokens[0]))
+                        and all(tok.upper() not in DIRECTIONAL_TOKENS for tok in maybe_city)
+                    ):
+                        street = " ".join(street_tokens)
+                        city = " ".join(maybe_city)
+                    else:
+                        street = before_state
+                        city = ""
                 else:
                     street = before_state
                     city = ""
@@ -2566,15 +2583,25 @@ def extract_state_zip_anywhere(text: str) -> Tuple[str, str]:
 
     v75: applies ZIP OCR rescue to ZIP-like tokens before searching.
     """
-    t = fix_state_ocr_tokens(text or '')
-    t = normalize_zip_candidates(t)
-    zipm = re.search(ZIP_RE, t)
-    if not zipm:
-        return '', ''
-    left = t[max(0, zipm.start() - 30):zipm.start() + 5]
-    statem = re.search(US_STATE_RE, left, re.IGNORECASE)
-    st = normalize_state(statem.group(0)) if statem else ''
-    return st, zipm.group(0)
+    t_raw = fix_state_ocr_tokens(text or '')
+    t_norm = normalize_zip_candidates(t_raw)
+    zipm = re.search(ZIP_RE, t_norm)
+    if zipm:
+        left = t_norm[max(0, zipm.start() - 30):zipm.start() + 5]
+        statem = re.search(US_STATE_RE, left, re.IGNORECASE)
+        st = normalize_state(statem.group(0)) if statem else ''
+        return st, zipm.group(0)
+
+    for m in NEAR_ZIP_RE.finditer(t_raw.upper()):
+        z = normalize_zip_token(m.group(0))
+        if not re.fullmatch(r"\d{5}", z):
+            continue
+        left = t_raw[max(0, m.start() - 30):m.start() + 5]
+        statem = re.search(US_STATE_RE, left, re.IGNORECASE)
+        st = normalize_state(statem.group(0)) if statem else ''
+        return st, z
+
+    return '', ''
 
 def try_ocrmac_text(pil_img: Image.Image, recognition_level: str = 'accurate', framework: str = 'vision', language_preference: Optional[list] = None) -> str:
     """Last-resort OCR using Apple Vision (ocrmac).
