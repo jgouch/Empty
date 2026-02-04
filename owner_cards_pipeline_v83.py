@@ -3472,37 +3472,37 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
                 "HeaderOCRUsedOCRmacVision": bool(owner_header_meta.get('ocrmac_vision')) if isinstance(owner_header_meta, dict) else False,
                 "HeaderOCRUsedOCRmacLiveText": bool(owner_header_meta.get('ocrmac_livetext')) if isinstance(owner_header_meta, dict) else False,
                 "HeaderOCRUsedKraken": bool(owner_header_meta.get('kraken')) if isinstance(owner_header_meta, dict) else False,
- "OCRRescueUsed": False,
- "OCRRescueDPI": '',
+                "OCRRescueUsed": False,
+                "OCRRescueDPI": '',
             }
             owner.update(phone_fields)
-                # v83: conditional high-DPI header rescue
-    try:
-        if should_rescue_header(owner.get('PrimaryOwnerName',''), owner.get('Street',''), owner.get('State',''), owner.get('ZIP',''), owner.get('RawText','')):
-            rp, rmeta, raddr = rescue_header_high_dpi(pdf_path, page_index, dpi, target_char,
-                                                     kraken_model=kraken_model, kraken_bin=kraken_bin,
-                                                     kraken_python=kraken_python, allow_livetext=allow_livetext,
-                                                     alt_ocr=alt_ocr)
-            if rmeta and rmeta.get('used'):
-                owner['OCRRescueUsed'] = True
-                owner['OCRRescueDPI'] = str(rmeta.get('dpi',''))
-                if ('[MISSING' in str(owner.get('PrimaryOwnerName','')).upper()) and rp:
-                    owner['PrimaryOwnerName'] = rp
-                if (not owner.get('Street')) and raddr.get('Street'):
-                    owner['Street'] = normalize_street(raddr.get('Street',''))
-                if (not owner.get('City')) and raddr.get('City'):
-                    owner['City'] = raddr.get('City','')
-                if (not owner.get('State')) and raddr.get('State'):
-                    owner['State'] = raddr.get('State','')
-                if (not owner.get('ZIP')) and raddr.get('ZIP'):
-                    owner['ZIP'] = normalize_zip_token(raddr.get('ZIP',''))
-                if (not owner.get('AddressRaw')) and raddr.get('AddressRaw'):
-                    owner['AddressRaw'] = raddr.get('AddressRaw','')
-    except Exception:
-        pass
+            # v83: conditional high-DPI header rescue
+            try:
+                if should_rescue_header(owner.get('PrimaryOwnerName',''), owner.get('Street',''), owner.get('State',''), owner.get('ZIP',''), owner.get('RawText','')):
+                    rp, rmeta, raddr = rescue_header_high_dpi(pdf_path, page_index, dpi, target_char,
+                                                             kraken_model=kraken_model, kraken_bin=kraken_bin,
+                                                             kraken_python=kraken_python, allow_livetext=allow_livetext,
+                                                             alt_ocr=alt_ocr)
+                    if rmeta and rmeta.get('used'):
+                        owner['OCRRescueUsed'] = True
+                        owner['OCRRescueDPI'] = str(rmeta.get('dpi',''))
+                        if ('[MISSING' in str(owner.get('PrimaryOwnerName','')).upper()) and rp:
+                            owner['PrimaryOwnerName'] = rp
+                        if (not owner.get('Street')) and raddr.get('Street'):
+                            owner['Street'] = normalize_street(raddr.get('Street',''))
+                        if (not owner.get('City')) and raddr.get('City'):
+                            owner['City'] = raddr.get('City','')
+                        if (not owner.get('State')) and raddr.get('State'):
+                            owner['State'] = raddr.get('State','')
+                        if (not owner.get('ZIP')) and raddr.get('ZIP'):
+                            owner['ZIP'] = normalize_zip_token(raddr.get('ZIP',''))
+                        if (not owner.get('AddressRaw')) and raddr.get('AddressRaw'):
+                            owner['AddressRaw'] = raddr.get('AddressRaw','')
+            except Exception:
+                pass
 
-        owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=None, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader, facts_space_index=facts_space_index, facts_owner_index=facts_owner_index, facts_maus_index=facts_maus_index)
-        return owner, items, is_interment
+            owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=None, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader, facts_space_index=facts_space_index, facts_owner_index=facts_owner_index, facts_maus_index=facts_maus_index)
+            return owner, items, is_interment
 
     # OCR FALLBACK (full)
     pil_original = render_page(pdf_path, page_index, dpi=dpi)
@@ -3599,11 +3599,11 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
         "HeaderOCRUsedOCRmacVision": bool(header_meta.get('ocrmac_vision')) if isinstance(header_meta, dict) else False,
         "HeaderOCRUsedOCRmacLiveText": bool(header_meta.get('ocrmac_livetext')) if isinstance(header_meta, dict) else False,
         "HeaderOCRUsedKraken": bool(header_meta.get('kraken')) if isinstance(header_meta, dict) else False,
- "OCRRescueUsed": False,
- "OCRRescueDPI": '',
+        "OCRRescueUsed": False,
+        "OCRRescueDPI": '',
     }
     owner.update(phone_fields)
-        # v83: conditional high-DPI header rescue
+    # v83: conditional high-DPI header rescue
     try:
         if should_rescue_header(owner.get('PrimaryOwnerName',''), owner.get('Street',''), owner.get('State',''), owner.get('ZIP',''), owner.get('RawText','')):
             rp, rmeta, raddr = rescue_header_high_dpi(pdf_path, page_index, dpi, target_char,
@@ -3628,7 +3628,7 @@ def process_page(pdf_path: str, page_index: int, dpi: int, target_char: Optional
     except Exception:
         pass
 
-owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader, facts_space_index=facts_space_index, facts_owner_index=facts_owner_index, facts_maus_index=facts_maus_index)
+    owner = enrich_owner_with_review(owner, items, pdf_path, page_index+1, dpi=dpi, pil_page=pil_original, facts_sections=facts_sections, facts_mode=facts_mode, reader=reader, facts_space_index=facts_space_index, facts_owner_index=facts_owner_index, facts_maus_index=facts_maus_index)
     if (not owner.get('ZIP')) or (not owner.get('State')) or ('[MISSING' in str(owner.get('PrimaryOwnerName','')).upper()):
         hlines = ocr_header_lines(pil_original)
         parsed = parse_header_from_lines(hlines)
