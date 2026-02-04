@@ -2102,13 +2102,13 @@ def _strip_phone_extension(raw: str) -> str:
     if not raw:
         return ""
     # Strip extensions like 'ext123', 'ext 123', 'x123', 'x 123' (case-insensitive)
-    parts = re.split(r"\s*(?:ext\.?|x)\s*\d{1,6}\b", raw, maxsplit=1, flags=re.IGNORECASE)
+    parts = re.split(r"(?<![A-Za-z])(?:ext\.?|x)\s*\d{1,6}\b", raw, maxsplit=1, flags=re.IGNORECASE)
     return parts[0]
 
 def _extract_phone_extension(raw: str) -> str:
     if not raw:
         return ""
-    m = re.search(r"\b(?:ext\.?|x)\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
+    m = re.search(r"(?<![A-Za-z])(?:ext\.?|x)\s*(\d{1,6})\b", raw, flags=re.IGNORECASE)
     return m.group(1) if m else ""
 
 def _normalize_phone_digits(d: str) -> Tuple[str, bool, bool]:
